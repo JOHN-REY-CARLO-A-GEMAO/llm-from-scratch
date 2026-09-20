@@ -60,6 +60,23 @@ bash tests/run_all.sh
 
 Steps are ordered by dependency: corpus file → tokenizer → dataset.
 
+## One-command run (Windows)
+
+`run.ps1` trains the small **`out_fast`** model on first use (30 iters,
+d_model 96 / 2 layers / 3 heads — under a minute on a laptop CPU) and then
+generates; later runs reuse the checkpoint and just sample.
+
+```powershell
+.\run.ps1                                  # default prompt, 200 tokens
+.\run.ps1 -Prompt "Once upon a time" -N 150
+.\run.ps1 -Eval                            # also print val ppl
+.\run.ps1 -Retrain                         # wipe out_fast and train fresh
+```
+
+If the execution policy blocks `.ps1` scripts, or you prefer double-click /
+cmd: **`run.bat`** (forwards all arguments). Checkpoints stay under `out_fast/`,
+which is git-ignored.
+
 ## Outputs you should see
 
 | artefact | meaning |
