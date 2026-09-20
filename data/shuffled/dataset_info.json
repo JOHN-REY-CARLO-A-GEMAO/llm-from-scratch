@@ -1,0 +1,18 @@
+{
+  "train": {
+    "n_tokens": 371354,
+    "n_docs": 579,
+    "n_blocks": 1182
+  },
+  "val": {
+    "n_tokens": 18759,
+    "n_docs": 30,
+    "n_blocks": 60
+  },
+  "block_size": 256,
+  "vocab": 4096,
+  "train_doc_tokens": {
+    "mean": 641.371329879102,
+    "p10": 514.0
+  }
+}

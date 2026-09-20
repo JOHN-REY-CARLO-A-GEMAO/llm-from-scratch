@@ -1,0 +1,14 @@
+# checkpoints / outputs (regenerable, can be large)
+out*/
+*.pt
+*.jsonl
+curves.png
+eval.json
+
+# logs
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
