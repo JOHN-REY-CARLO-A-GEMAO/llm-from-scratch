@@ -91,6 +91,31 @@ Text streams to the terminal as tokens are generated (including with `--quiet`,
 which prints only prompt + continuation). Byte-level UTF-8 fragments are buffered
 until a complete character is ready, so Unicode doesn't break during streaming.
 
+### Browser chat UI
+
+The same chat checkpoint is also wrapped in a dark-mode web interface —
+tokens stream into the page as they are generated, **Temperature** (0.1–1.5)
+and **Top-P** (0.1–1.0) are sliders, and **Clear Chat** wipes the history:
+
+```powershell
+.\run_web.ps1       # Windows: serve + open the browser  (double-click run_web.bat also works)
+```
+
+or directly:
+
+```bash
+python web_ui.py    # http://127.0.0.1:7860  (also bound on 0.0.0.0:7860 for your LAN)
+```
+
+It loads `out/model_chat.pt` + `out/model_chat_config.json`, uses a **gradio**
+`ChatInterface` when gradio is installed (`pip install gradio`), and falls back
+to a built-in zero-dependency `http.server` page when it is not — nothing extra
+to install beyond PyTorch. Endpoints: `GET /` (the page), `POST /api/chat`
+(newline-delimited JSON token stream), `POST /api/stop`, `GET /api/info`.
+Multi-turn history, the `<|im_start|>` framing, and context trimming behave
+exactly like the terminal chat above. `--backend stdlib|gradio|auto`,
+`--no-browser`, `--port`, and `--host` adjust the launch.
+
 For a persistent prompt session:
 
 ```bash
@@ -135,7 +160,9 @@ knobs) for machines that also have the training environment.
 07_make_sft.py         deterministic 6,000-example children's assistant dataset
 08_sft.py              response-only-loss SFT from model_best.pt (250 steps)
 generate.py            continuation + multi-turn chat CLI (CPU, torch-only deps)
+web_ui.py              browser chat UI: token streaming, temp/top-p sliders, clear button
 run.ps1 / run.bat      one-click Windows launchers for generate.py
+run_web.ps1 / .bat     one-click Windows launchers for the browser chat UI
 sample.py              research generation CLI
 _stage.py              import shim (module names can't start with a digit)
 data/tinystories/      the cleaned corpus + provenance (committed)
