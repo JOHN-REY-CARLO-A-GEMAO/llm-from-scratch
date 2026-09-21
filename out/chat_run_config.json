@@ -1,0 +1,21 @@
+{
+  "data": "data/sft/chat_sft.jsonl",
+  "model": "out/model_best.pt",
+  "config": "out/config.json",
+  "tokenizer": "tokenizer",
+  "chat_tokenizer": "tokenizer/chat",
+  "out": "out/model_chat.pt",
+  "iters": 250,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "min_lr_frac": 0.1,
+  "warmup": 10,
+  "weight_decay": 0.01,
+  "eval_every": 50,
+  "val_examples": 256,
+  "seed": 2026,
+  "autocast": "none",
+  "vocab_size": 4098,
+  "best_val_loss": 0.36667876873113636,
+  "seconds": 55.47037315368652
+}

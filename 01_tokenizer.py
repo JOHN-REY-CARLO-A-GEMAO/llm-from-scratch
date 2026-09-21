@@ -79,9 +79,15 @@ def _index_of_pair(sp: list[str], a: str, b: str) -> int | None:
 
 
 class ByteLevelBPE:
-    def __init__(self, vocab_size: int = 4096, special_tokens: tuple[str, ...] = ()):
+    def __init__(self, vocab_size: int = 4096, special_tokens: tuple[str, ...] = (),
+                 added_tokens: tuple[str, ...] = ()):
         self.vocab_size = vocab_size
+        # Training-time specials live before the BPE merges (the historical
+        # <|doc_end|> is id 256). Tokens added to an already-trained tokenizer
+        # must be appended, or every learned merge id -- and every checkpoint
+        # embedding row -- would silently move.
         self.special_tokens = list(special_tokens)
+        self.added_tokens = list(added_tokens)
         self.merges: list[tuple[str, str]] = []
         self.token_to_id: dict[str, int] = {}
         self.id_to_token: dict[int, str] = {}
@@ -99,6 +105,8 @@ class ByteLevelBPE:
             tok = "".join(merge)
             if tok not in self.token_to_id:
                 self.token_to_id[tok] = len(self.token_to_id)
+        for tok in self.added_tokens:
+            self.token_to_id.setdefault(tok, len(self.token_to_id))
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
         # (a, b) -> merge rank, the fast encoder's lookup table. Rebuilt with the
         # vocabulary, and the word cache is dropped: its entries belong to the
@@ -309,7 +317,7 @@ class ByteLevelBPE:
         hands back whatever it sampled, and `<|doc_end|>` is a legal sample.
         (Malformed UTF-8 still becomes U+FFFD, by design: BPE is byte-level, so
         a partially generated multi-byte character must not crash the decoder.)"""
-        special = {self.token_to_id[s] for s in self.special_tokens}
+        special = {self.token_to_id[s] for s in self.special_tokens + self.added_tokens}
         if not special.intersection(ids):          # common path: one join, no split
             return unicode_to_bytes("".join(self.id_to_token[i] for i in ids)).decode(
                 "utf-8", errors="replace")
@@ -335,16 +343,19 @@ class ByteLevelBPE:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         with open(path / "bpe.pkl", "wb") as f:
-            pickle.dump({"merges": self.merges, "special": self.special_tokens}, f)
+            pickle.dump({"merges": self.merges, "special": self.special_tokens,
+                         "added": self.added_tokens}, f)
         (path / "meta.json").write_text(json.dumps(
             {"vocab_size": self.vocab, "n_merges": len(self.merges),
-             "special_tokens": self.special_tokens}, indent=2))
+             "special_tokens": self.special_tokens,
+             "added_tokens": self.added_tokens}, indent=2))
 
     @classmethod
     def load(cls, path: str | Path) -> "ByteLevelBPE":
         with open(Path(path) / "bpe.pkl", "rb") as f:
             st = pickle.load(f)
-        tok = cls(vocab_size=0, special_tokens=tuple(st["special"]))
+        tok = cls(vocab_size=0, special_tokens=tuple(st["special"]),
+                  added_tokens=tuple(st.get("added", ())))
         tok.merges = st["merges"]
         tok._build_vocab()
         return tok

@@ -17,6 +17,7 @@
   .\run.ps1                                        # default prompt, 150 tokens, temp 0.8
   .\run.ps1 -Prompt "Once upon a time" -N 250
   .\run.ps1 -Interactive                           # prompts without reloading weights
+  .\run.ps1 -Chat                                  # instruction-tuned multi-turn chatbot
   .\run.ps1 -Seed 4294967295                       # reproducible output
   .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
 
@@ -35,7 +36,8 @@ param(
     [string]$Ckpt   = "out/model_best.pt",
     [string]$Python = "python",
     [double]$RepeatPenalty = 1.15,
-    [switch]$Interactive
+    [switch]$Interactive,
+    [switch]$Chat
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +70,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- 3. is the checkpoint there? -------------------------------------------
+# -Chat selects the SFT checkpoint unless the caller explicitly chose -Ckpt.
+if ($Chat -and -not $PSBoundParameters.ContainsKey("Ckpt")) { $Ckpt = "out/model_chat.pt" }
 if (-not (Test-Path -LiteralPath $Ckpt)) {
     Write-Host "[run] Checkpoint '$Ckpt' not found." -ForegroundColor Yellow
     Write-Host "      It is committed to this repository (~8 MB) - fetch it with:  git pull"
@@ -80,6 +84,7 @@ Write-Host "[run] generating with $exe  (Ctrl+C stops it)" -ForegroundColor Cyan
 $genArgs = @("generate.py", "--ckpt", $Ckpt, "--prompt", $Prompt, "--n", $N,
              "--temp", $Temp, "--top-k", $TopK, "--top-p", $TopP, "--repeat-penalty", $RepeatPenalty)
 if ($Interactive) { $genArgs += "--interactive" }
+if ($Chat) { $genArgs += "--chat" }
 if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
 
 & $exe @genArgs

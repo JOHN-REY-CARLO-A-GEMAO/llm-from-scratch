@@ -315,10 +315,11 @@ class Llama(nn.Module):
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
-            # no ignore_index: blocks are packed from real documents, never padded,
-            # so every position is a valid training target. If you switch to sequence
-            # packing with padding, set an ignore index and mask it here.
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            # -100 is PyTorch's conventional ignore index. Pretraining blocks have
+            # no padding, while SFT uses it both for padding and for user/prompt
+            # tokens so gradients come only from assistant responses.
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1), ignore_index=-100)
         return logits, loss
 
     # ------------------------------------------------------------- param groups

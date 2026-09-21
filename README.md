@@ -48,6 +48,45 @@ present, then calls `generate.py`. `run.bat` is the same thing for cmd/double-cl
 python generate.py --prompt "Once upon a time, Lily found a little kitten" --n 150 --temp 0.7 --seed 1337
 ```
 
+### Instruction-tuned chat
+
+The repository also ships a 250-step supervised fine-tune of the TinyStories
+checkpoint. Start a multi-turn conversation with:
+
+```powershell
+.\run.ps1 -Chat
+```
+
+or directly:
+
+```bash
+python generate.py --chat
+```
+
+Chat mode selects `out/model_chat.pt` and `tokenizer/chat`, wraps every turn as
+`<|im_start|>user\n...<|im_end|>` / `<|im_start|>assistant\n...`, retains
+complete turns in the 256-token context, and stops as soon as `<|im_end|>` is
+sampled. Type `/clear` to discard history or `/exit` to leave. The base
+continuation mode and `out/model_best.pt` remain unchanged.
+
+The committed `data/sft/chat_sft.jsonl` contains 6,000 deterministic synthetic
+instruction-response pairs (greetings, children's animal questions, everyday
+explanations, kindness, arithmetic, and tiny stories). Each row includes the
+prompt, response, and exact serialized `text`. Rebuild and fine-tune it with:
+
+```bash
+python 07_make_sft.py                         # writes 6,000 JSONL rows
+python 08_sft.py --iters 250 --lr 1e-4        # cosine decay; writes model_chat.pt
+```
+
+`08_sft.py` appends the two chat markers without changing any pretrained token
+ID, expands the tied embedding by two rows, and masks user text, role markers,
+prior turns, and padding with label `-100`. Thus cross-entropy is computed only
+on the current assistant response and its end marker. It also trains on
+synthetic two-turn arrangements so retained history works at inference. The
+shipped run reached validation loss 0.367 (perplexity 1.44) on 256 held-out
+examples; see `out/chat_log.jsonl` and `out/chat_run_config.json`.
+
 Text streams to the terminal as tokens are generated (including with `--quiet`,
 which prints only prompt + continuation). Byte-level UTF-8 fragments are buffered
 until a complete character is ready, so Unicode doesn't break during streaming.
@@ -93,7 +132,9 @@ knobs) for machines that also have the training environment.
 04_train.py            training loop: AdamW, cosine LR, grad clip, fp32, eval, checkpoints
 05_evaluate.py         loss / ppl / top-1 / bits-per-byte + unigram & bigram baselines + curves
 06_generate.py         temperature, top-k, top-p, repeat penalty, KV cache
-generate.py            inference-only CLI (CPU, torch-only deps)   <- what your laptop runs
+07_make_sft.py         deterministic 6,000-example children's assistant dataset
+08_sft.py              response-only-loss SFT from model_best.pt (250 steps)
+generate.py            continuation + multi-turn chat CLI (CPU, torch-only deps)
 run.ps1 / run.bat      one-click Windows launchers for generate.py
 sample.py              research generation CLI
 _stage.py              import shim (module names can't start with a digit)
