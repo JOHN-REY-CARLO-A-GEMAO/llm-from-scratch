@@ -3,9 +3,11 @@
 **A complete, verified pipeline: data → tokenizer → transformer → training → evaluation → generation.**
 
 Every code block in this guide is from the working files in this folder, and every number
-reported was produced by actually running them. The model in `out/` was trained on the machine
-writing this document (2 CPU cores, 2 GB RAM), so the run is small by design — the *pipeline* is
-what transfers to scale, not the model size.
+reported was produced by actually running them. The model in `out/` was trained on a 2-core CPU
+box in about 8 minutes (400 steps, fp32, ~7,300 tok/s), so the run is small by design — the
+*pipeline* is what transfers to scale, not the model size. That checkpoint is committed, which is
+why `run.ps1` can generate text on a laptop without training anything; §9 has its numbers and
+`out/MODEL_CARD.md` has its limits.
 
 ---
 
@@ -503,12 +505,20 @@ is too high; near-zero with no loss progress means it's too low.
 | weight decay | 0.1 | 2-D weights only |
 | batch | 32 × 256 = 8,192 tok | tokens/step is the number that matters, not sequences |
 | grad clip | 1.0 | spikes are the failure mode at high LR |
-| precision | bf16 autocast | ~2× on CPU; fp32 master weights so small updates survive |
+| precision | bf16 autocast (`--autocast none` = fp32) | ~2× on CPU *with* bf16 hardware; fp32 master weights so small updates survive |
 
 **Why bf16 and not fp16.** bf16 has the same 8-bit exponent as fp32, so no overflow → no
 GradScaler needed. fp16 gives you one more mantissa bit but requires loss scaling and a scaler
-that can itself hide bugs. On CPU (this run) bf16 is simply correct-and-faster; on GPU fp16+scaler
-is the historical default and bf16 is preferable if the hardware supports it.
+that can itself hide bugs; on GPU fp16+scaler is the historical default and bf16 is preferable if
+the hardware supports it.
+
+**The catch, measured on this box:** "bf16 is faster on CPU" is only true if the CPU has
+AVX512-BF16 (or AMX). Without it PyTorch emulates bf16 with fp32 ops, and the emulation costs more
+than it saves: the same 1600×1600 matmul took **1.84 ms/step in fp32 vs 8.84 ms/step under bf16
+autocast** — ~5× *slower*. `--autocast` is a flag precisely so the precision follows the hardware
+instead of being baked in: `bf16` (the default) on a bf16-capable box, `none` on anything older.
+Whichever you pick, keep it for evaluation too (`05_evaluate.py --autocast …`) or the val loss you
+report will not be the one the trainer selected checkpoints with.
 
 **Mixed precision detail**: master weights and the optimizer state stay fp32; only the forward/
 backward matmuls are bf16. `RMSNorm` deliberately computes in fp32 internally — a sum of squares
@@ -692,8 +702,11 @@ python sample.py --prompt "It was a dark and stormy night" --n 200 --temp 0.8 --
 
 ## 9. Results
 
-**A finished 150-step run**, on this box (2 CPU cores, 2 GB RAM): 1.9M params, 4096 vocab,
-256-token context, effective batch 32 sequences, bf16. It saw 1.23 M training tokens ≈ 4 epochs.
+**The first run — 150 steps, bf16, on a 2 CPU core / 2 GB RAM box:** 1.9M params, 4096 vocab,
+256-token context, effective batch 32 sequences. It saw 1.23 M training tokens ≈ 4 epochs.
+It did *not* clear the bigram gate, and the section ends by saying so. The *shipped* checkpoint
+(400 steps, fp32) is the next subsection; this one is kept because the honest mid-training
+numbers are the useful part.
 
 ```
 iter   0    loss 8.307    (ln(4096) = 8.318 — the uniform baseline; init verified in 25 ms)
@@ -715,6 +728,64 @@ still has not clearly learned to use more than one token of context. Beating uni
 losing to a Markov chain is a completely ordinary place for 1.9M params and 1.2M tokens to be;
 this corpus is ~0.4M tokens, so one more epoch of LR-schedule *completion* (not just more steps)
 is what would move it. I'd rather hand you that than quietly compare against unigram instead.
+
+### The shipped checkpoint — 400 steps, fp32 (this is `out/model_best.pt`)
+
+Same 1.9M-param model, same corpus, same schedule shape — more steps to the *end* of the cosine
+(the first run stopped at the halfway point of its schedule, which is why its LR never decayed).
+2 CPU cores, ~8 minutes wall clock, **3.28 M tokens** (≈11 epochs over the 0.30 M-token train
+split), fp32 at **~7,300 tok/s**:
+
+```
+[train] iter     0/400  loss 8.3072  lr 1.50e-05  gnorm 0.83  6,100 tok/s
+[  eval] iter    50     val_loss 6.3597  val_ppl 578.05     <- checkpoint saved
+[  eval] iter   100     val_loss 5.3654  val_ppl 213.88     <- still worse than bigram (178.9)
+[  eval] iter   150     val_loss 4.9416  val_ppl 139.99     <- crosses the bigram floor
+[  eval] iter   200     val_loss 4.7306  val_ppl 113.36
+[  eval] iter   250     val_loss 4.6162  val_ppl 101.11
+[  eval] iter   300     val_loss 4.5478  val_ppl  94.42
+[  eval] iter   350     val_loss 4.5090  val_ppl  90.83
+[  eval] iter   400     val_loss 4.4949  val_ppl  89.56     <- out/model_best.pt
+
+[eval] val loss 4.4949 | ppl 89.56 | top-1 24.73% | bits/byte 1.712 (0.264 tok/byte)
+[base] uniform ppl 4,096 | unigram ppl 736.25 | bigram Markov ppl 178.89
+[base] this model ppl = 89.56   (49.9% lower ppl, 13.3% lower cross-entropy, vs the bigram floor)
+```
+
+**What this pair actually shows, and what it does not.** The two runs differ in three ways at
+once — 400 vs 150 steps, fp32 vs emulated bf16, warmup 40 vs 30 — so resist reading a single cause
+into the gap. The defensible reading is (a) the shipped model wins on every measure (val ppl 89.6
+vs 198.6, top-1 24.7% vs 19.5%, bits/byte 1.712 vs 2.015) and (b) the one variable with a clean
+mechanism behind it is **tokens to the end of the cosine**: 3.28 M vs 1.23 M. If you want to
+attribute the rest, re-run 400 steps with and without `--autocast bf16` and compare — I have not,
+so I am not claiming the precision did it, even though "bf16 emulation is 5× slower *and* adds
+rounding noise" is a plausible story. This is the same discipline the bigram gate enforces:
+measure, then attribute.
+
+One schedule note that *is* worth carrying forward: at iteration 150 of the 400-step schedule the
+model already sat at train loss 5.01, while the 150-step run ended its *fully annealed* schedule at
+5.37. An un-annealed model halfway through a longer run beat a fully annealed short one, because
+8× the steps remain. When someone reports a loss, the schedule position is part of the number.
+
+Generation, same prompt and settings as above but 150 tokens, `--temp 0.8 --seed 1337`, KV cache,
+376–390 tok/s on 2 threads (unedited):
+
+```
+It was a dark and stormy night at the cars of his taced at the lock that his a man might be only
+all an good, and the tramoning fug.”
+
+“I was so much of some unppeconer.”
+
+“And it did you be a few few minutes,’ said he. “How is sofgs for the stlient. You think which I
+have been in the pusing?’
+
+“If I cannot be in the clue or in his hand?” He cried. “My bay to look. The rooms which may be as
+much from Miss Holmes, and I can ask that for
+```
+
+Compare with the 150-step text above: real words (`minutes`, `cried`, `rooms`, `Holmes`), stable
+dialogue scaffolding, and still nonsense in the content slots. That is the correct *shape* of
+progress at this budget — fluency of form first, meaning last.
 
 Trainer-vs-`05` cross-check, same weights: `5.3851` vs `5.2912`. Different by design — the trainer
 scores 32 of the 60 val blocks (its batch size is clamped to divide them exactly) while `05` scores
@@ -741,7 +812,8 @@ mangled "Holmes". Grammar and spelling inside the sentences are broken, as they 
 and not yet its syntax — which is precisely the thing to check when you build your own.
 
 Measured KV-cache effect, 200 tokens, both cores free: **0.54 s cached vs 1.66 s uncached (3.1×)**,
-generation at 376 tok/s, and exact (`cached == uncached`).
+generation at 376 tok/s, and exact (`cached == uncached`). The shipped checkpoint samples at a
+similar ~386 tok/s on 2 threads (150 tokens in 0.41 s, including the prompt prefill).
 
 A metric worth keeping for byte-level BPE models — broken-UTF-8 rate (the model emitted a lone
 continuation byte of a multi-byte sequence):
@@ -762,7 +834,7 @@ it would be wrong to tune against it — which is true of every cheap generation
 |---|---|---|
 | tokenizer | pure-Python BPE is fine | Rust `tokenizers`/`tiktoken`, ~1000× faster; vocab 32–128k |
 | data | 1.4 MB, one process | TB-scale, dedup + quality filtering, web-scale mixing, tokenise offline into shards (this pipeline's shape, at 10⁶× the size) |
-| precision | bf16 autocast | bf16 + FSDP/ZeRO, activation checkpointing |
+| precision | bf16 autocast (fp32 if the CPU can't do bf16 natively) | bf16 + FSDP/ZeRO, activation checkpointing |
 | parallelism | none | tensor + pipeline + data parallel |
 | attention | masked softmax | FlashAttention (fused, avoids materialising T×T) |
 | batch | 8k tok/step | 1–4M tok/step |
@@ -800,9 +872,11 @@ Five things worth stealing from production recipes:
 | `04_train.py` | training loop, LR schedule, eval, checkpointing |
 | `05_evaluate.py` | loss/ppl/accuracy/bpb, unigram + bigram baselines, loss curve |
 | `06_generate.py` | sampling (temp/top-k/top-p/repeat-penalty) + KV cache |
-| `sample.py` | generation CLI |
+| `sample.py` | generation CLI (research: every knob, cached-vs-uncached timing) |
+| `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths |
+| `run.ps1` / `run.bat` | one-click Windows launchers for `generate.py` |
 | `data/corpus.txt`, `data/shuffled/` | cleaned corpus, tokenised blocks |
-| `tokenizer/`, `out/` | vocabulary, checkpoints, `log.jsonl`, `eval.json` |
+| `tokenizer/`, `out/` | vocabulary, the committed checkpoint + `config.*`, `log.jsonl`, `eval.json`, `MODEL_CARD.md` |
 
 ## 12. The bugs, catalogued
 

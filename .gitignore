@@ -5,6 +5,19 @@ out*/
 curves.png
 eval.json
 
+# ...except the artefacts that are committed ON PURPOSE: the trained 1.9M-param
+# checkpoint (7.6 MB) that CPU-only inference loads via generate.py / run.ps1,
+# the config needed to read it, and the numbers/curve that document the run.
+# Rule order matters: git cannot re-include a file whose parent directory is
+# still excluded, so `out/` itself must be un-ignored first. Everything else
+# under out/ (model_*.pt, opt.pt, curves.png) stays ignored.
+!out/
+!out/config.txt
+!out/config.json
+!out/eval.json
+!out/log.jsonl
+!out/model_best.pt
+
 # logs
 *.log
 

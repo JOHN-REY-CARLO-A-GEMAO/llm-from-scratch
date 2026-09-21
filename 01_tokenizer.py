@@ -249,8 +249,33 @@ class ByteLevelBPE:
         return ids
 
     def decode(self, ids: list[int]) -> str:
-        return unicode_to_bytes("".join(self.id_to_token[i] for i in ids)).decode(
-            "utf-8", errors="replace")
+        """Inverse of encode() — including encode_with_specials().
+
+        Special tokens are not bytes, so they are rendered literally instead of
+        raising KeyError. That asymmetry matters at inference time: the sampler
+        hands back whatever it sampled, and `<|doc_end|>` is a legal sample.
+        (Malformed UTF-8 still becomes U+FFFD, by design: BPE is byte-level, so
+        a partially generated multi-byte character must not crash the decoder.)"""
+        special = {self.token_to_id[s] for s in self.special_tokens}
+        if not special.intersection(ids):          # common path: one join, no split
+            return unicode_to_bytes("".join(self.id_to_token[i] for i in ids)).decode(
+                "utf-8", errors="replace")
+        out: list[str] = []
+        run: list[int] = []
+
+        def flush() -> None:
+            out.append(unicode_to_bytes("".join(self.id_to_token[i] for i in run))
+                       .decode("utf-8", errors="replace"))
+            run.clear()
+
+        for i in ids:
+            if i in special:
+                flush()
+                out.append(self.id_to_token[i])
+            else:
+                run.append(i)
+        flush()
+        return "".join(out)
 
     # ------------------------------------------------------------------- saving
     def save(self, path: str | Path) -> None:
