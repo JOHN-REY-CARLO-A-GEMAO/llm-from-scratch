@@ -290,10 +290,13 @@ def main() -> None:
         description="Generate text from a trained checkpoint on the CPU.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--ckpt", default=None,
-                    help="checkpoint (.pt); defaults to model_chat.pt in --chat, else model_best.pt")
+                    help="checkpoint (.pt); defaults to model_15m_chat.pt / model_15m_chat_int8.pt in --chat, "
+                         "else model_best.pt")
     ap.add_argument("--config", default=None, help="default: checkpoint-specific config, then config.json/config.txt")
     ap.add_argument("--tokenizer", default=None,
                     help="tokenizer directory; defaults to tokenizer/chat in --chat, else tokenizer")
+    ap.add_argument("--quantized", "--int8", dest="quantized", action="store_true",
+                    help="load an INT8-quantized checkpoint (written by quantize.py)")
     ap.add_argument("--prompt", default="Once upon a time, there was a little girl named Lily",
                     help="text to continue; '' starts from the model's document token")
     ap.add_argument("-n", "--n", "--tokens", dest="n", type=int, default=150,
@@ -315,8 +318,27 @@ def main() -> None:
     args = ap.parse_args()
     if args.chat:
         args.interactive = True
+    # Default checkpoint selection: prefer the 15M chat checkpoint if present,
+    # then fall back to the original 1.9M model_chat.pt. If --quantized, pick
+    # the INT8 variant automatically.
     if args.ckpt is None:
-        args.ckpt = "out/model_chat.pt" if args.chat else "out/model_best.pt"
+        suffix = "_int8.pt" if args.quantized else ".pt"
+        if args.chat:
+            for cand in ("out/model_15m_chat", "out/model_chat"):
+                p = resolve(Path(cand + suffix))
+                if p.exists():
+                    args.ckpt = cand + suffix
+                    break
+            else:
+                args.ckpt = "out/model_chat" + suffix
+        else:
+            for cand in ("out/model_15m_best", "out/model_best"):
+                p = resolve(Path(cand + suffix))
+                if p.exists():
+                    args.ckpt = cand + suffix
+                    break
+            else:
+                args.ckpt = "out/model_best" + suffix
     if args.tokenizer is None:
         args.tokenizer = "tokenizer/chat" if args.chat else "tokenizer"
     if args.n < 0:
@@ -326,6 +348,7 @@ def main() -> None:
     from _stage import load as _load          # noqa: E402  (needs torch already importable)
     model_mod, gen_mod = _load("03_model"), _load("06_generate")
     tok_mod = _load("01_tokenizer")
+    import quantize                           # noqa: E402
     try:
         gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
                                repeat_penalty=args.repeat_penalty, seed=args.seed)
@@ -340,30 +363,53 @@ def main() -> None:
     ckpt = resolve(Path(args.ckpt))
     if not ckpt.exists():
         die(f"checkpoint {ckpt} not found.\n"
-            f"      It is committed to the repo (~8 MB) — run `git pull`, then retry.\n"
+            f"      It is committed to the repo (~15 MB for 15M model, ~8 MB for 1.9M model) "
+            f"— run `git pull`, then retry.\n"
             f"      Or point at another one:  python generate.py --ckpt out/model_best.pt")
     cfg_path = find_config(ckpt, args.config)
     tok_dir = resolve(Path(args.tokenizer))
     if not (tok_dir / "bpe.pkl").exists():
         die(f"tokenizer {tok_dir}/bpe.pkl not found — run `git pull`, it is committed too.")
 
-    cfg = model_mod.GPTConfig.load(cfg_path)   # strict: unknown keys are an error, not a guess
-    model = model_mod.GPT(cfg)
-    state = torch.load(ckpt, map_location="cpu", weights_only=True)
-    try:
-        model.load_state_dict(state)
-    except RuntimeError as e:
-        die(f"{ckpt} does not match {cfg_path}.\n      {e}\n"
-            f"      They are a pair: pull both from the same commit.")
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    # ---- load model: INT8-quantized path OR plain fp32 path ----
+    # Auto-detect quantized checkpoints by magic key: a quantized file is a dict
+    # with "magic"="quantized_v1"; a plain fp32 file is a raw state_dict. We do
+    # this by reading the file once and branching, so torch.load is called
+    # exactly one time regardless of which path we take.
+    is_int8 = args.quantized
+    raw = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if not is_int8:
+        is_int8 = isinstance(raw, dict) and raw.get("magic") == "quantized_v1"
+    if is_int8:
+        if not (isinstance(raw, dict) and raw.get("magic") == "quantized_v1"):
+            die(f"{ckpt} was expected to be an INT8 quantized checkpoint but lacks the magic marker.")
+        cfg_dict = raw["config"]
+        cfg = model_mod.GPTConfig(**cfg_dict)
+        model = model_mod.GPT(cfg)
+        quantize.quantize_model(model, per_channel=raw.get("per_channel", True))
+        model.load_state_dict(raw["state_dict"], strict=True)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+    else:
+        cfg = model_mod.GPTConfig.load(cfg_path)   # strict: unknown keys are an error, not a guess
+        model = model_mod.GPT(cfg)
+        state = raw
+        try:
+            model.load_state_dict(state)
+        except RuntimeError as e:
+            die(f"{ckpt} does not match {cfg_path}.\n      {e}\n"
+                f"      They are a pair: pull both from the same commit.")
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
     tok = tok_mod.ByteLevelBPE.load(tok_dir)
 
     if not args.quiet:
         print(f"[gen] torch {torch.__version__}  device cpu  threads {args.threads}")
+        qtag = "  INT8 quantized" if quantize.is_quantized(model) else ""
         print(f"[gen] checkpoint {ckpt}  ({model.num_params():,} params, "
-              f"{ckpt.stat().st_size / 1e6:.1f} MB)")
+              f"{ckpt.stat().st_size / 1e6:.1f} MB){qtag}")
         print(f"[gen] config {cfg_path}  ({cfg.n_layer} layers, {cfg.n_head} heads, "
               f"d_model {cfg.d_model}, context {cfg.block_size}, vocab {cfg.vocab_size})")
         print(f"[gen] arch   RMSNorm + RoPE(base {getattr(cfg, 'rope_base', 10000.0):g}) + SwiGLU + "

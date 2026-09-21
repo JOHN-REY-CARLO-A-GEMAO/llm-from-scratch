@@ -1,0 +1,10 @@
+{
+  "vocab_size": 4096,
+  "block_size": 256,
+  "n_layer": 6,
+  "n_head": 6,
+  "d_model": 288,
+  "dropout": 0.0,
+  "rope_base": 10000.0,
+  "rms_norm_eps": 1e-05
+}

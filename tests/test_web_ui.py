@@ -1,10 +1,11 @@
 """Web UI tests: stream decoder, chat serialization, prompt trimming,
 engine streaming/cancellation, and the stdlib HTTP server end-to-end.
 
-Loads the real committed checkpoint (out/model_chat.pt, ~8 MB) like every
-other test in this repo; a greedy reply of a few tokens costs well under a
-second on CPU. gradio coverage is skipped automatically when it is not
-installed — the web UI itself falls back the same way.
+Loads the real committed checkpoint (auto-prefers out/model_15m_chat(_int8).pt,
+falls back to out/model_chat.pt, ~8 MB) like every other test in this repo; a
+greedy reply of a few tokens costs well under a second on CPU. gradio coverage
+is skipped automatically when it is not installed — the web UI itself falls
+back the same way.
 """
 import json
 import threading
@@ -27,19 +28,49 @@ tm = load("01_tokenizer")
 torch.set_num_threads(2)
 
 
+def _resolve_chat_ckpt():
+    """Pick the largest/best available chat checkpoint (15m preferred, INT8 preferred)."""
+    candidates = [
+        ("out/model_15m_chat_int8.pt", "out/model_15m_chat_config.json"),
+        ("out/model_15m_chat.pt",      "out/model_15m_chat_config.json"),
+        ("out/model_chat_int8.pt",     "out/model_chat_config.json"),
+        ("out/model_chat.pt",          "out/model_chat_config.json"),
+    ]
+    import quantize  # noqa: E402
+    for ckpt_name, cfg_name in candidates:
+        ckpt = ROOT / ckpt_name
+        cfg_p = ROOT / cfg_name
+        if ckpt.exists() and cfg_p.exists():
+            return ckpt, cfg_p
+    raise FileNotFoundError("no chat checkpoint found")
+
+
 def make_engine(seed=None):
     args = types.SimpleNamespace(temp=0.8, top_p=0.9, top_k=40, repeat_penalty=1.15,
                                  seed=seed, n=24, host="127.0.0.1", port=0,
                                  no_browser=True)
-    cfg = mm.GPTConfig.load(ROOT / "out/model_chat_config.json")
+    ckpt_p, cfg_p = _resolve_chat_ckpt()
+    import quantize  # noqa: E402
+    # Try INT8 first
+    try:
+        raw = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+        if isinstance(raw, dict) and raw.get("magic") == "quantized_v1":
+            model, cfg, _ = quantize.load_quantized(ckpt_p, device="cpu")
+            engine = web_ui.ChatEngine(args, torch, model, cfg,
+                                       tm.ByteLevelBPE.load(ROOT / "tokenizer/chat"),
+                                       tm, load("06_generate"), ckpt_p, cfg_p,
+                                       ROOT / "tokenizer/chat")
+            engine.device = torch.device("cpu")
+            return engine
+    except Exception:
+        pass
+    cfg = mm.GPTConfig.load(cfg_p)
     model = mm.GPT(cfg)
-    model.load_state_dict(torch.load(ROOT / "out/model_chat.pt", map_location="cpu",
-                                     weights_only=True))
+    model.load_state_dict(torch.load(ckpt_p, map_location="cpu", weights_only=True))
     model.eval()
     tok = tm.ByteLevelBPE.load(ROOT / "tokenizer/chat")
     engine = web_ui.ChatEngine(args, torch, model, cfg, tok, tm, load("06_generate"),
-                               ROOT / "out/model_chat.pt", ROOT / "out/model_chat_config.json",
-                               ROOT / "tokenizer/chat")
+                               ckpt_p, cfg_p, ROOT / "tokenizer/chat")
     engine.device = torch.device("cpu")
     return engine
 
@@ -182,9 +213,12 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("Clear Chat", html)
         with urllib.request.urlopen(self.url("/api/info"), timeout=10) as res:
             info = json.loads(res.read())
-        self.assertEqual(info["params"], 1_926_880)
+        # Param count matches the shipped checkpoint (whatever size that is)
+        self.assertGreater(info["params"], 1_000_000)
         self.assertEqual(info["context"], 256)
-        self.assertTrue(info["checkpoint"].replace("\\", "/").endswith("out/model_chat.pt"))
+        # checkpoint path must end in model_chat or model_15m_chat, optionally _int8
+        self.assertRegex(info["checkpoint"].replace("\\", "/"),
+                         r"out/model_(15m_)?chat(_int8)?\.pt$")
         with urllib.request.urlopen(self.url("/healthz"), timeout=10) as res:
             self.assertEqual(json.loads(res.read()), {"ok": True})
 

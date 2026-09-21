@@ -459,8 +459,9 @@ footer {
 <div id="chat"><div class="wrap" id="messages">
   <div id="welcome">
     <h2>Say hello to your from-scratch LLM 👋</h2>
-    <p>A 1.9 M-parameter transformer, tokenizer and chat fine-tune all built and
-    trained locally. It runs entirely on this machine — nothing leaves your network.</p>
+    <p>A ~15 M-parameter transformer (Llama-style), tokenizer and chat fine-tune all
+    built and trained locally. INT8 quantized from scratch for ~4x smaller weights.
+    It runs entirely on this machine — nothing leaves your network.</p>
     <div class="examples">
       <button class="example">Hello! Who are you?</button>
       <button class="example">Tell me a short story about a cat.</button>
@@ -827,8 +828,8 @@ def build_gradio_app(engine: ChatEngine, args):
     kw = dict(
         fn=respond,
         title=f"{APP_NAME} · local LLM",
-        description=("A 1.9 M-parameter transformer trained from scratch, running "
-                     "entirely on this machine. Responses stream token by token."),
+        description=("A ~15 M-parameter Llama-style transformer trained from scratch with "
+                     "INT8 weight quantization, running entirely on this machine. Responses stream token by token."),
         examples=[["Hello! Who are you?", args.temp, args.top_p],
                   ["Tell me a short story about a cat.", args.temp, args.top_p],
                   ["What is 2 + 3?", args.temp, args.top_p],
@@ -869,10 +870,13 @@ def main() -> None:
         prog="web_ui.py",
         description="Browser chat UI for the fine-tuned checkpoint (gradio if available, stdlib otherwise).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--ckpt", default="out/model_chat.pt", help="chat checkpoint (.pt)")
+    ap.add_argument("--ckpt", default=None,
+                    help="chat checkpoint (.pt); auto-selects model_15m_chat(_int8).pt when present")
     ap.add_argument("--config", default=None,
-                    help="default: <ckpt>_config.json (i.e. out/model_chat_config.json), then config.json/txt")
+                    help="default: <ckpt>_config.json (i.e. out/model_15m_chat_config.json), then config.json/txt")
     ap.add_argument("--tokenizer", default="tokenizer/chat", help="chat tokenizer directory")
+    ap.add_argument("--quantized", "--int8", dest="quantized", action="store_true",
+                    help="load an INT8-quantized checkpoint (written by quantize.py)")
     ap.add_argument("--host", default="0.0.0.0", help="bind address (0.0.0.0 = localhost + LAN)")
     ap.add_argument("--port", type=int, default=7860, help="web UI port")
     ap.add_argument("-n", "--n", "--max-tokens", dest="n", type=int, default=128,
@@ -891,6 +895,26 @@ def main() -> None:
     if args.n < 1:
         ap.error("--n must be >= 1")
 
+    # Default checkpoint selection mirrors generate.py: prefer the 15M chat
+    # checkpoint (int8 or fp32) if it exists on disk.
+    if args.ckpt is None:
+        suffix = "_int8.pt" if args.quantized else ".pt"
+        for cand in ("out/model_15m_chat", "out/model_chat"):
+            p = resolve(Path(cand + suffix))
+            if p.exists():
+                args.ckpt = cand + suffix
+                break
+        else:
+            args.ckpt = "out/model_chat" + suffix
+        # If the int8 variant exists prefer it even without --quantized (auto-detect).
+        if not args.quantized:
+            for cand in ("out/model_15m_chat_int8.pt", "out/model_chat_int8.pt"):
+                p = resolve(Path(cand))
+                if p.exists():
+                    args.ckpt = cand
+                    args.quantized = True
+                    break
+
     # Deferred so `--help` works with no torch installed; same wording as the CLI.
     try:
         import generate as cli
@@ -900,6 +924,7 @@ def main() -> None:
     from _stage import load as _load        # noqa: E402  (needs torch already importable)
     model_mod, gen_mod = _load("03_model"), _load("06_generate")
     tok_mod = _load("01_tokenizer")
+    import quantize                         # noqa: E402
     try:
         gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
                                repeat_penalty=args.repeat_penalty, seed=args.seed)
@@ -913,23 +938,40 @@ def main() -> None:
     ckpt = resolve(Path(args.ckpt))
     if not ckpt.exists():
         die(f"checkpoint {ckpt} not found.\n"
-            f"      It is committed to the repo (~8 MB) — run `git pull`, then retry.")
+            f"      It is committed to the repo (~15 MB for 15M model, ~8 MB for 1.9M model) "
+            f"— run `git pull`, then retry.")
     cfg_path = cli.find_config(ckpt, args.config)   # out/model_chat_config.json by default
     tok_dir = resolve(Path(args.tokenizer))
     if not (tok_dir / "bpe.pkl").exists():
         die(f"tokenizer {tok_dir}/bpe.pkl not found — run `git pull`, it is committed too.")
 
-    cfg = model_mod.GPTConfig.load(cfg_path)        # strict: unknown keys are an error
-    model = model_mod.GPT(cfg)
-    state = torch.load(ckpt, map_location="cpu", weights_only=True)
-    try:
-        model.load_state_dict(state)
-    except RuntimeError as e:
-        die(f"{ckpt} does not match {cfg_path}.\n      {e}\n"
-            f"      They are a pair: pull both from the same commit.")
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    # ---- load model: INT8-quantized path OR plain fp32 path ----
+    # Auto-detect quantized checkpoints by magic. One torch.load() total.
+    is_int8 = args.quantized
+    raw = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if not is_int8:
+        is_int8 = isinstance(raw, dict) and raw.get("magic") == "quantized_v1"
+    if is_int8:
+        if not (isinstance(raw, dict) and raw.get("magic") == "quantized_v1"):
+            die(f"{ckpt} was expected to be an INT8 checkpoint but lacks the magic marker.")
+        cfg = model_mod.GPTConfig(**raw["config"])
+        model = model_mod.GPT(cfg)
+        quantize.quantize_model(model, per_channel=raw.get("per_channel", True))
+        model.load_state_dict(raw["state_dict"], strict=True)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+    else:
+        cfg = model_mod.GPTConfig.load(cfg_path)        # strict: unknown keys are an error
+        model = model_mod.GPT(cfg)
+        try:
+            model.load_state_dict(raw)
+        except RuntimeError as e:
+            die(f"{ckpt} does not match {cfg_path}.\n      {e}\n"
+                f"      They are a pair: pull both from the same commit.")
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
     tok = tok_mod.ByteLevelBPE.load(tok_dir)
     for marker in (IM_START, IM_END):
         if marker not in tok.token_to_id:
@@ -938,9 +980,10 @@ def main() -> None:
 
     engine = ChatEngine(args, torch, model, cfg, tok, tok_mod, gen_mod, ckpt, cfg_path, tok_dir)
     engine.device = torch.device("cpu")             # CPU-only, like generate.py, on purpose
+    qtag = "  INT8 quantized" if quantize.is_quantized(model) else ""
     print(f"[web] torch {torch.__version__}  device cpu  threads {args.threads}")
     print(f"[web] checkpoint {ckpt}  ({model.num_params():,} params, "
-          f"{ckpt.stat().st_size / 1e6:.1f} MB)")
+          f"{ckpt.stat().st_size / 1e6:.1f} MB){qtag}")
     print(f"[web] config {cfg_path}  ({cfg.n_layer} layers, {cfg.n_head} heads, "
           f"d_model {cfg.d_model}, context {cfg.block_size}, vocab {cfg.vocab_size})")
     print(f"[web] tokenizer {tok_dir}  (vocab {tok.vocab})", flush=True)
