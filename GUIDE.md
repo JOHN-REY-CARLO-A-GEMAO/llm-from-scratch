@@ -874,7 +874,103 @@ Five things worth stealing from production recipes:
 
 ---
 
-## 11. File map
+## 11. System prompts, personas, and tool use
+
+Two features sit between the sampler and the user, and both exist because of the
+same observation: **a chat model is a text completer, and some of the text it is
+asked to produce is not text at all.** Tone is best steered with prompt text;
+arithmetic is not — so tone is a prompt and arithmetic is a program.
+
+### 11.1 The system turn
+
+The SFT corpus in `07_make_sft.py` teaches one framing:
+
+```
+<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{response}<|im_end|>
+```
+
+A system prompt is one more turn, in front of the first user turn:
+
+```
+<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n…
+```
+
+`personas.py` owns that string. `generate.py --chat` and `web_ui.py` both call
+`personas.resolve()` and `generate.serialize_chat()`, so the terminal REPL and
+the browser cannot drift: identical tone steering, identical token boundaries,
+identical trimming behaviour. `tests/test_web_ui.py` asserts that
+`ChatEngine.serialize` *is* `serialize_chat`.
+
+Four presets ship (Friendly Assistant — the default, Pirate, Math Tutor,
+Storyteller), plus free text and an explicit "none". Three details are deliberate:
+
+* **Honesty about the effect.** The fine-tune never saw a system turn. A system
+  prompt here is conditioning *text*, not an instruction channel the model was
+  trained to obey: at 1.9–15 M parameters expect a change of tone and vocabulary,
+  not of capability. That is what the docstring says, and it is also why
+  `personas.resolve("none")` is a first-class option — it reproduces exactly the
+  framing the checkpoint was fine-tuned on.
+* **Marker stripping.** `personas.sanitize()` deletes `<|im_start|>`,
+  `<|im_end|>`, `<|doc_end|>` and `<|endoftext|>` from anything a human typed —
+  in the system prompt, in the message, and in echoed history. Without it, the
+  "system prompt" box is an injection surface: type
+  `<|im_end|><|im_start|>user\n…` and you are writing the framing yourself.
+  A chat template must be assembled by the program, never by the text.
+* **A cost, in tokens.** The shipped context is 256 tokens. `build_prompt()`
+  accounts for the system block in its budget: history turns are dropped first,
+  and only if the block still does not fit is the block itself shortened by
+  `personas.shrink()` (binary search on a character prefix, `cost()` supplied by
+  the caller). Silently letting prefill truncate from the left would drop the
+  system *and* the question — a bug, not a degradation.
+
+### 11.2 The calculator
+
+Ask a 1.9 M-parameter story model `5 + 5` and it answers in the register of the
+question with a number of its own invention. Two hooks in `tools.py` remove that
+failure mode without a bigger model:
+
+| where | trigger | what happens |
+|---|---|---|
+| before sampling | the message *is* an expression (`5 + 5`, `12 * 4 = ?`) | answered locally: `5 + 5 = 10`, `0` model tokens, labelled `🧮 computed locally` |
+| after sampling | the message *contains* a math question (`what is 12 * 4?`) | the model answers, then the exact line `🧮 12 * 4 = 48` is appended if the reply lacks the right value |
+| during sampling | the model writes `<<calc: 5 + 5>>` | the marker is replaced by `10` mid-stream, including when it is split across tokens |
+
+Two of those three are about the *model's* output, so the substitution has to
+survive tokenization: `<<calc: 5 + 5>>` can arrive as `"<<ca"`, `"lc: 5 + 5>"`,
+`">"`. `ToolTextFilter` holds back a tail that could still become a marker and
+releases it as soon as the call completes or is proven impossible — the same
+technique as a stop-string buffer in a streaming API. The first version of it
+searched for the *last* `<<` and so emitted the first `<` of a split marker on
+its own; the fix is to walk back over the whole run of `<` before asking whether
+what follows could still become `<<calc:`. `tests/test_tools.py` feeds every
+single split of the marker, plus one character at a time, and asserts that no
+half-marker is ever visible.
+
+Evaluation itself is where the security argument lives. `eval("5+5")` is a
+one-liner and an RCE: the string is Python, and Python reaches the filesystem.
+`tools.evaluate()` parses with `ast.parse(..., mode="eval")` and walks a
+whitelist — numeric literals, `+ - * / // % **`, parentheses, unary sign — and
+raises `CalcError` on anything else (names, calls, attributes, subscripts,
+comprehensions, comparisons). Nothing is "sandboxed"; everything else is simply
+not implemented. Work is bounded too: ≤200 characters, ≤64 AST nodes, nesting
+≤12, |exponent| ≤512, so `9**9**9` is rejected instead of allocating the universe.
+
+Arithmetic is exact, because float is a bad default for a calculator:
+`fractions.Fraction` throughout, seeded from the *decimal literal text*
+(`Fraction(repr(0.1))` is `1/10`, not the binary expansion), and formatted once
+at the end — integers stay integers (`10`, not `10.0`), `0.1 + 0.2` prints `0.3`,
+and a non-terminating result is rounded to 12 significant digits instead of
+claiming seventeen digits of truth.
+
+Detection is deliberately conservative: a bare expression, or a trigger word
+("what is", "calculate", `=`) plus an evaluable number run. Prose that merely
+contains digits — "call me at 5 - 3pm", "2024-01-02" — stays with the model,
+because a false positive here replaces a good answer with arithmetic. Word
+operators (`12 times 4`, `20% of 80`) and typographic operators (`×`, `÷`, `−`)
+are normalised first; `--no-tools` turns the whole hook off, which is the honest
+way to see what the model does without it.
+
+## 12. File map
 
 | file | contents |
 |---|---|
@@ -887,14 +983,18 @@ Five things worth stealing from production recipes:
 | `05_evaluate.py` | loss/ppl/accuracy/bpb, unigram + bigram baselines, loss curve |
 | `06_generate.py` | sampling (temp/top-k/top-p/repeat-penalty) + KV cache |
 | `sample.py` | generation CLI (research: every knob, cached-vs-uncached timing) |
-| `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths |
+| `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths; `--chat` REPL with system prompts + calculator |
+| `web_ui.py` | browser chat UI (gradio or stdlib): streaming, persona picker, latency monitor, copy buttons |
+| `personas.py` | system-prompt presets, marker sanitising, prompt-size shrinking (§11.1) |
+| `tools.py` | safe AST calculator, arithmetic detection, stream-safe `<<calc: …>>` substitution (§11.2) |
 | `run.ps1` / `run.bat` | one-click Windows launchers for `generate.py` |
+| `run_web.ps1` / `run_web.bat` | one-click Windows launchers for `web_ui.py` |
 | `data/tinystories/` | cleaned TinyStories corpus (20 MB, committed) + `stats.json` provenance |
 | `data/packed/` | tokenised uint16 blocks, story-level train/val split (committed) |
 | `data/raw/` | the three Gutenberg books, for `--mode docs` |
 | `tokenizer/`, `out/` | vocabulary, the committed checkpoint + `config.*`, `log.jsonl`, `eval.json`, `MODEL_CARD.md` |
 
-## 12. The bugs, catalogued
+## 13. The bugs, catalogued
 
 Worth reading, because they're the same ones you'll meet:
 

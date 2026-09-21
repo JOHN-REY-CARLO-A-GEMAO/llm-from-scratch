@@ -18,6 +18,9 @@
   .\run.ps1 -Prompt "Once upon a time" -N 250
   .\run.ps1 -Interactive                           # prompts without reloading weights
   .\run.ps1 -Chat                                  # instruction-tuned multi-turn chatbot
+  .\run.ps1 -Chat -Persona pirate                   # ...as a salty sea dog (friendly|pirate|math|storyteller|none)
+  .\run.ps1 -Chat -SystemPrompt "You are a robot."  # ...with your own system prompt
+  .\run.ps1 -Chat -NoTools                          # ...without the calculator hook
   .\run.ps1 -Seed 4294967295                       # reproducible output
   .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
   .\run.ps1 -Int8                                  # force INT8 quantized checkpoint
@@ -37,8 +40,11 @@ param(
     [string]$Ckpt   = "",          # empty = auto-select (15m -> 1.9m, int8 preferred)
     [string]$Python = "python",
     [double]$RepeatPenalty = 1.15,
+    [string]$Persona = "",        # chat system prompt preset (friendly|pirate|math|storyteller|none)
+    [string]$SystemPrompt = "",   # chat system prompt, free text (wins over -Persona)
     [switch]$Interactive,
     [switch]$Chat,
+    [switch]$NoTools,             # disable the calculator hook (math goes to the model)
     [switch]$Int8
 )
 
@@ -105,6 +111,9 @@ $genArgs = @("generate.py", "--ckpt", $Ckpt, "--prompt", $Prompt, "--n", $N,
 if ($Int8) { $genArgs += "--quantized" }
 if ($Interactive) { $genArgs += "--interactive" }
 if ($Chat) { $genArgs += "--chat" }
+if ($Persona) { $genArgs += @("--persona", $Persona) }
+if ($SystemPrompt) { $genArgs += @("--system", $SystemPrompt) }
+if ($NoTools) { $genArgs += "--no-tools" }
 if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
 
 & $exe @genArgs

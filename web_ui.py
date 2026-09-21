@@ -17,9 +17,24 @@ Two interchangeable frontends, selected with --backend (default: auto):
 
 Both frontends talk to the same ChatEngine, which mirrors generate.py's
 --chat REPL exactly: out/model_chat.pt + out/model_chat_config.json, the
-tokenizer/chat byte-BPE, <|im_start|>/<|im_end|> turn framing, oldest complete
-turns dropped when the 256-token context fills, and generation stops the
-moment <|im_end|> is sampled.
+tokenizer/chat byte-BPE, <|im_start|>/<|im_end|> turn framing, an optional
+<|im_start|>system turn (personas.py), oldest complete turns dropped when the
+256-token context fills, and generation stops the moment <|im_end|> is sampled.
+
+Three things the browser adds on top of the terminal:
+
+ * **System prompt / persona picker.** Four presets (friendly, pirate, math,
+   storyteller), a custom text box, and an explicit "None" that sends no system
+   turn at all. The resolved text is re-serialised server-side for every
+   request, so switching persona mid-conversation cannot leave a stale block in
+   the prompt.
+ * **Calculator hook** (tools.py). A bare "5 + 5" is answered by the calculator
+   *before* the model runs, and a `<<calc: …>>` the model emits is substituted
+   with the exact value mid-stream. Both paths are labelled in the UI, so a
+   computed answer is never confused with a sampled one.
+ * **Token counter / latency monitor** in the header: live tokens, tok/s and
+   elapsed time while streaming, then time-to-first-token, prompt size and seed
+   for the finished turn — the numbers come from the server, not from guesswork.
 
 Design notes, each of which is a real bug it avoids:
 
@@ -61,6 +76,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:            # the stage files are importable by name
     sys.path.insert(0, str(HERE))
+
+import generate as cli                   # noqa: E402  (stdlib-only; for serialize_chat)
+import personas                          # noqa: E402  (system-prompt presets)
+import tools                             # noqa: E402  (safe calculator)
 
 APP_NAME = "TinyStories Chat"
 MAX_MESSAGE_CHARS = 4000                 # prompt-injection-by-paste is a RAM problem, not a model one
@@ -136,11 +155,24 @@ class ChatEngine:
         self.model_lock = threading.Lock()
         self._active_lock = threading.Lock()
         self._active_cancel: threading.Event | None = None
+        # getattr: tests and embedders build `args` by hand and only set what
+        # they need, so every new option must have a working default.
+        self.tools_on = not getattr(args, "no_tools", False)
+        system = getattr(args, "system", None)
+        self.default_persona_value = (system if system is not None
+                                      else getattr(args, "persona", None)
+                                      if getattr(args, "persona", None) is not None
+                                      else personas.DEFAULT_SLUG)
 
     # ------------------------------------------------------------ bookkeeping
     def info(self) -> dict:
+        label, text = personas.resolve(self.default_persona_value, tool_hint=self.tools_on)
         return {
             "app": APP_NAME,
+            "persona": label,
+            "personas": personas.choices(),
+            "system": text,
+            "tools": self.tools_on,
             "checkpoint": str(self.ckpt_path),
             "checkpoint_mb": round(self.ckpt_path.stat().st_size / 1e6, 1),
             "config": str(self.cfg_path),
@@ -164,21 +196,45 @@ class ChatEngine:
         return False
 
     # ------------------------------------------------------------- serialize
-    def serialize(self, turns: list[tuple[str, str]], user: str) -> str:
+    def serialize(self, turns: list[tuple[str, str]], user: str, system: str | None = None) -> str:
         """The exact SFT template from generate.py's chat REPL — divergence
         between terminal and browser formatting would change the model's
-        behaviour for the same conversation."""
-        done = [f"{IM_START}user\n{u}{IM_END}\n{IM_START}assistant\n{a}{IM_END}"
-                for u, a in turns]
-        current = f"{IM_START}user\n{user}{IM_END}\n{IM_START}assistant\n"
-        return "\n".join(done + [current])
+        behaviour for the same conversation. `generate.serialize_chat` *is* the
+        implementation, so there is exactly one string template in the repo."""
+        return cli.serialize_chat(system or "", turns, user)
 
-    def build_prompt(self, user: str, history, max_new: int):
+    def resolve_system(self, system: str | None = None,
+                       persona: str | None = None) -> tuple[str, str]:
+        """Resolve one request's system prompt to `(label, text)`.
+
+        The page resolves the dropdown itself and sends the literal text, which
+        is what makes "edited a preset" work; `persona` is the slug fallback for
+        plain API clients. The math tutor's calculator hint is attached here, so
+        a browser that only knows preset text still gets it (and a wholly custom
+        prompt never does).
+        """
+        if system is not None and str(system).strip():
+            preset = personas.get(persona) if persona else None
+            text = personas.sanitize(str(system))
+            if preset is not None and preset.hint and self.tools_on and text == preset.system:
+                text = f"{text}\n\n{preset.hint}"
+            return (preset.label if preset is not None else "Custom"), text
+        return personas.resolve(persona if persona is not None else self.default_persona_value,
+                                tool_hint=self.tools_on)
+
+    def build_prompt(self, user: str, history, max_new: int, system: str | None = None):
         """Validate + clamp inputs from the wire, then drop oldest complete
-        turns until the prompt leaves room for an answer."""
-        user = str(user).strip()[:MAX_MESSAGE_CHARS]
+        turns until the prompt leaves room for an answer.
+
+        Returns `(user, turns, ids, dropped, system)`. The system block is the
+        last thing to give way: it is the only part of the prompt the user did
+        not type just now, but leaving it in when it does not fit would make
+        prefill truncate from the left and silently discard the *question*.
+        """
+        user = personas.sanitize(str(user).strip(), MAX_MESSAGE_CHARS)[:MAX_MESSAGE_CHARS]
         if not user:
             raise ValueError("message is empty")
+        system = personas.sanitize(system) if system else ""
         turns: list[tuple[str, str]] = []
         for h in (history or [])[-MAX_HISTORY_TURNS:]:
             if isinstance(h, dict):           # wire format from the browser
@@ -189,30 +245,42 @@ class ChatEngine:
                 continue                      # a malformed turn is dropped, not fatal
             if not isinstance(u, str) or not isinstance(a, str):
                 continue
-            u, a = u.strip()[:MAX_MESSAGE_CHARS], a.strip()[:MAX_MESSAGE_CHARS]
+            u, a = (personas.sanitize(u, MAX_MESSAGE_CHARS)[:MAX_MESSAGE_CHARS],
+                    personas.sanitize(a, MAX_MESSAGE_CHARS)[:MAX_MESSAGE_CHARS])
             if u and a:
                 turns.append((u, a))
 
-        prompt = self.serialize(turns, user)
-        ids = self.tok.encode_with_specials(prompt, [IM_START, IM_END])
         reserve = min(max_new, max(32, self.cfg.block_size // 3))
+        budget = self.cfg.block_size - reserve
+
+        def encode(prompt_system: str) -> list[int]:
+            return self.tok.encode_with_specials(
+                self.serialize(turns, user, prompt_system), [IM_START, IM_END])
+
+        ids = encode(system)
         dropped = 0
-        while turns and len(ids) > self.cfg.block_size - reserve:
+        while turns and len(ids) > budget:
             turns.pop(0)
             dropped += 1
-            prompt = self.serialize(turns, user)
-            ids = self.tok.encode_with_specials(prompt, [IM_START, IM_END])
-        return user, turns, ids, dropped
+            ids = encode(system)
+        if system and len(ids) > budget:
+            system = personas.shrink(system, lambda text: len(encode(text)), budget)
+            ids = encode(system)
+        return user, turns, ids, dropped, system
 
     # ------------------------------------------------------------ generation
     def stream_chat(self, message: str, history, temperature: float, top_p: float,
-                    max_tokens: int | None = None):
-        """Yield ("token", text) / ("done", meta) / ("error", msg) events.
+                    max_tokens: int | None = None, system: str | None = None,
+                    persona: str | None = None):
+        """Yield ("token", text) / ("tool", info) / ("done", meta) / ("error", msg).
 
         Generation runs on a worker thread (the caller's thread is busy
         writing events to a socket or generator), so the on_token callback
         only decodes and enqueues. Cancelling sets an event that the callback
         turns into _Aborted, unwinding generate() between two tokens.
+
+        A bare arithmetic question ("5 + 5") never reaches the model at all:
+        the reply is exact, so there is nothing for the sampler to contribute.
         """
         a = self.args
         try:
@@ -229,10 +297,32 @@ class ChatEngine:
             max_new = a.n
         max_new = min(max(max_new, 1), self.cfg.block_size - 1)
 
+        system_label, system_text = self.resolve_system(system, persona)
         try:
-            user, turns, prompt_ids, dropped = self.build_prompt(message, history, max_new)
+            user, turns, prompt_ids, dropped, system_text = self.build_prompt(
+                message, history, max_new, system_text)
         except ValueError as e:
             yield ("error", str(e))
+            return
+
+        # ---- calculator hook: answer explicit arithmetic without the model ----
+        query = tools.find_math_question(user) if self.tools_on else None
+        if query is not None and query.bare:
+            started = time.perf_counter()
+            yield ("tool", {"expression": query.expression, "result": query.text,
+                            "line": query.answer, "source": "question"})
+            yield ("token", query.answer)
+            yield ("done", {"reply": query.answer, "source": "calculator",
+                            "n_tokens": 0, "tok_per_s": None,
+                            "elapsed_s": round(time.perf_counter() - started, 4),
+                            "first_token_s": round(time.perf_counter() - started, 4),
+                            "seed": None, "temperature": temperature, "top_p": top_p,
+                            "stop_reason": "tool", "turns_dropped": dropped,
+                            "history_turns": len(turns), "prompt_tokens": len(prompt_ids),
+                            "system": system_text, "persona": system_label,
+                            "tool": {"expression": query.expression, "result": query.text,
+                                     "line": query.answer, "source": "question"},
+                            "tool_calls": []})
             return
 
         cancel = threading.Event()
@@ -246,14 +336,21 @@ class ChatEngine:
 
         def worker() -> None:
             decoder = IncrementalText(self.tok, self.tok_mod.unicode_to_bytes)
+            tool_filter = tools.ToolTextFilter() if self.tools_on else None
             streamed: list[str] = []
             n_emitted = [0]                  # list: closure needs a mutable cell
+            first_token: list[float | None] = [None]
+            t0 = time.perf_counter()         # replaced once the lock is held
 
             def emit(token_id: int) -> None:
                 if cancel.is_set():
                     raise _Aborted
                 n_emitted[0] += 1
+                if first_token[0] is None:
+                    first_token[0] = time.perf_counter() - t0
                 text = decoder.feed(token_id)
+                if tool_filter is not None:
+                    text = tool_filter.feed(text)
                 if text:
                     streamed.append(text)
                     events.put(("token", text))
@@ -271,7 +368,18 @@ class ChatEngine:
                         eos_id=self.end_id, device=self.device,
                         block_size=self.cfg.block_size, on_token=emit)
                     elapsed = time.perf_counter() - t0
-                    streamed.append(decoder.finish())
+                    tail = decoder.finish()
+                    if tool_filter is not None:
+                        tail = tool_filter.feed(tail) + tool_filter.finish()
+                    streamed.append(tail)
+                    # A math question the model answered *without* the right
+                    # number is the failure this hook exists to prevent: append
+                    # the exact value instead of letting a guess stand alone.
+                    if query is not None and not tools.value_in_text(
+                            query.calculation, "".join(streamed)):
+                        extra = f"\n\n🧮 {query.answer}"
+                        streamed.append(extra)
+                        events.put(("token", extra))
                 new = ids[len(prompt_ids):]
                 stopped_on_eos = bool(new) and new[-1] == self.end_id
                 if stopped_on_eos:
@@ -279,26 +387,50 @@ class ChatEngine:
                 reason = ("stop" if stopped_on_eos
                           else "length" if len(new) >= max_new else "context")
                 reply = "".join(streamed).strip()
-                events.put(("done", {
+                calls = [c.line for c in tool_filter.calls] if tool_filter is not None else []
+                meta = {
                     "reply": reply,
+                    "source": "model",
                     "n_tokens": len(new),
                     "tok_per_s": round(len(new) / elapsed, 1) if elapsed > 0 else None,
                     "elapsed_s": round(elapsed, 2),
+                    "first_token_s": (round(first_token[0], 3)
+                                     if first_token[0] is not None else None),
+                    "prompt_tokens": len(prompt_ids),
                     "seed": seed,
                     "temperature": temperature,
                     "top_p": top_p,
                     "stop_reason": reason,
                     "turns_dropped": dropped,
                     "history_turns": len(turns),
-                }))
+                    "system": system_text,
+                    "persona": system_label,
+                    "tool_calls": calls,
+                }
+                if query is not None:
+                    meta["tool"] = {"expression": query.expression, "result": query.text,
+                                    "line": query.answer, "source": "question"}
+                if calls:
+                    events.put(("tool", {"source": "model", "calls": calls}))
+                events.put(("done", meta))
             except _Aborted:
-                streamed.append(decoder.finish())
+                tail = decoder.finish()
+                if tool_filter is not None:
+                    tail = tool_filter.feed(tail) + tool_filter.finish()
+                streamed.append(tail)
                 events.put(("done", {"reply": "".join(streamed).strip(),
+                                     "source": "model",
                                      "n_tokens": max(0, n_emitted[0] - 1),
-                                     "tok_per_s": None, "elapsed_s": None, "seed": seed,
-                                     "temperature": temperature, "top_p": top_p,
+                                     "tok_per_s": None, "elapsed_s": None,
+                                     "first_token_s": (round(first_token[0], 3)
+                                                       if first_token[0] is not None else None),
+                                     "prompt_tokens": len(prompt_ids),
+                                     "seed": seed, "temperature": temperature, "top_p": top_p,
                                      "stop_reason": "stopped", "turns_dropped": dropped,
-                                     "history_turns": len(turns)}))
+                                     "history_turns": len(turns), "system": system_text,
+                                     "persona": system_label,
+                                     "tool_calls": ([c.line for c in tool_filter.calls]
+                                                    if tool_filter is not None else [])}))
             except Exception as e:           # a model error is one bad turn, not a dead server
                 events.put(("error", f"{type(e).__name__}: {e}"))
             finally:
@@ -373,13 +505,24 @@ button.primary { background: var(--accent-2); border-color: var(--accent-2); }
 button.primary:hover { background: var(--accent); border-color: var(--accent); }
 button.danger:hover { border-color: var(--danger); color: #ffb4b4; }
 #settings {
-  display: flex; flex-wrap: wrap; gap: 18px; padding: 10px 18px;
+  display: flex; flex-wrap: wrap; gap: 12px 18px; padding: 10px 18px; align-items: flex-end;
   border-bottom: 1px solid var(--border); background: rgba(16,20,29,.6);
 }
 .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex: 1; min-width: 220px; }
 .slider label { white-space: nowrap; }
 .slider output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
 input[type=range] { flex: 1; accent-color: var(--accent); height: 4px; }
+.ctl { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.ctl.persona { flex: 0 0 auto; }
+.ctl.prompt { flex: 1 1 320px; min-width: 220px; }
+select, #systemPrompt {
+  font: inherit; font-size: 13px; color: var(--text); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; outline: none;
+}
+select:focus, #systemPrompt:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(76,104,216,.22); }
+select { cursor: pointer; }
+#systemPrompt { resize: none; min-height: 36px; max-height: 120px; line-height: 1.4; }
+.chip.hide-sm { display: inline-flex; }
 #chat { flex: 1; overflow-y: auto; padding: 20px 0 12px; scroll-behavior: smooth; }
 .wrap { max-width: 780px; margin: 0 auto; padding: 0 18px; }
 .msg { display: flex; gap: 10px; margin: 14px 0; align-items: flex-start; }
@@ -397,8 +540,15 @@ input[type=range] { flex: 1; accent-color: var(--accent); height: 4px; }
 .msg.assistant { flex-direction: row; }
 .msg.assistant .bubblebox { min-width: 0; flex: 1; }
 .msg.assistant .bubble { background: var(--panel); border: 1px solid var(--border); border-top-left-radius: 4px; }
-.meta { font-size: 11.5px; color: var(--faint); margin-top: 5px; padding-left: 4px; min-height: 14px; }
+.meta { font-size: 11.5px; color: var(--faint); margin-top: 6px; padding-left: 4px; min-height: 14px; }
 .bubble.error { border-color: rgba(255,107,107,.5); color: #ffc9c9; background: rgba(255,107,107,.08); }
+.actions { display: flex; gap: 6px; margin-top: 6px; padding-left: 4px; }
+button.mini {
+  font-size: 11.5px; padding: 3px 9px; border-radius: 7px; color: var(--muted);
+  background: transparent; border: 1px solid var(--border);
+}
+button.mini:hover { color: var(--text); background: var(--panel-2); border-color: #31405e; }
+button.mini.ok { color: var(--ok); border-color: rgba(65,209,157,.5); }
 .caret { display: inline-block; width: 8px; height: 16px; vertical-align: text-bottom;
   background: var(--accent); border-radius: 2px; margin-left: 2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -428,6 +578,12 @@ footer {
 @media (max-width: 640px) {
   .subtitle { display: none; }
   #send { min-width: 70px; }
+  .chip.hide-sm { display: none; }
+  #settings { gap: 10px 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .caret { animation: none; }
+  #chat { scroll-behavior: auto; }
 }
 </style>
 </head>
@@ -439,11 +595,24 @@ footer {
     <div class="subtitle" id="subtitle">local LLM · built from scratch</div>
   </div>
   <div class="spacer"></div>
+  <span class="chip" title="Token counter + latency monitor: live tokens, tokens/second and elapsed time for the current reply">
+    ⚡ <span id="perf">idle</span></span>
+  <span class="chip hide-sm" title="Session totals since this page was loaded: generated tokens and replies">
+    Σ <span id="totals">0 tokens · 0 replies</span></span>
   <span class="chip" title="Model status"><span class="dot" id="statusDot"></span><span id="statusText">loading…</span></span>
   <button id="clearBtn" class="danger">Clear Chat</button>
 </header>
 
 <div id="settings">
+  <div class="ctl persona">
+    <label for="persona">System Prompt</label>
+    <select id="persona"></select>
+  </div>
+  <div class="ctl prompt">
+    <label for="systemPrompt">Prompt text <span id="sysNote"></span></label>
+    <textarea id="systemPrompt" rows="1" spellcheck="false"
+      placeholder="You are a helpful assistant…"></textarea>
+  </div>
   <div class="slider">
     <label for="temp">Temperature</label>
     <input type="range" id="temp" min="0.1" max="1.5" step="0.05" value="__TEMP__">
@@ -461,11 +630,13 @@ footer {
     <h2>Say hello to your from-scratch LLM 👋</h2>
     <p>A ~15 M-parameter transformer (Llama-style), tokenizer and chat fine-tune all
     built and trained locally. INT8 quantized from scratch for ~4x smaller weights.
-    It runs entirely on this machine — nothing leaves your network.</p>
+    It runs entirely on this machine — nothing leaves your network. Pick a system
+    prompt above to change its tone; arithmetic goes to a real calculator, not to
+    the model's guesswork.</p>
     <div class="examples">
       <button class="example">Hello! Who are you?</button>
       <button class="example">Tell me a short story about a cat.</button>
-      <button class="example">What is 2 + 3?</button>
+      <button class="example">What is 12 * 4?</button>
       <button class="example">Why is the sky blue?</button>
     </div>
   </div>
@@ -487,20 +658,130 @@ const sendBtn = document.getElementById('send');
 const clearBtn = document.getElementById('clearBtn');
 const tempEl = document.getElementById('temp'), tempVal = document.getElementById('tempVal');
 const toppEl = document.getElementById('topp'), toppVal = document.getElementById('toppVal');
+const personaEl = document.getElementById('persona');
+const promptEl = document.getElementById('systemPrompt');
+const sysNote = document.getElementById('sysNote');
+const perfEl = document.getElementById('perf');
+const totalsEl = document.getElementById('totals');
+
+// Presets come from personas.py (server-side, one source of truth for the
+// terminal REPL and the browser); the hint text is added server-side.
+const PERSONAS = __PERSONAS_JSON__;
+const DEFAULTS = { persona: "__DEFAULT_PERSONA__", system: __DEFAULT_SYSTEM_JSON__,
+                   tools: __TOOLS__ };
 
 let history = [];          // [{user, assistant}, ...] complete turns only — like the terminal REPL
 let busy = false;
 let controller = null;
+const session = { tokens: 0, replies: 0 };
 
 function autoresize() {
   inputEl.style.height = 'auto';
   inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+  promptEl.style.height = 'auto';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 120) + 'px';
 }
 inputEl.addEventListener('input', autoresize);
 tempEl.addEventListener('input', () => tempVal.textContent = (+tempEl.value).toFixed(2).replace(/0$/, ''));
 toppEl.addEventListener('input', () => toppVal.textContent = (+toppEl.value).toFixed(2).replace(/0$/, ''));
 
+// ---------------------------------------------------------------- personas
+function preset(slug) { return PERSONAS.find(p => p.slug === slug); }
+function textFor(slug, fallback) {
+  const p = preset(slug);
+  if (!p) return fallback || '';
+  return p.system;
+}
+function selectedSystem() {
+  return promptEl.value.trim();
+}
+function refreshSysNote() {
+  const p = preset(personaEl.value);
+  const active = selectedSystem();
+  let note = '';
+  if (!active) note = '· none sent';
+  else if (p && p.slug !== 'custom' && p.slug !== 'none') note = '· ' + p.name + ' preset';
+  if (DEFAULTS.tools && p && p.slug === 'math') note += ' · calculator hint added';
+  sysNote.textContent = note;
+}
+function selectPersona(slug) {
+  personaEl.value = preset(slug) ? slug : 'custom';
+  promptEl.value = textFor(personaEl.value, DEFAULTS.system);
+  autoresize();
+  refreshSysNote();
+}
+personaEl.addEventListener('change', () => {
+  promptEl.value = textFor(personaEl.value, '');
+  autoresize();
+  refreshSysNote();
+  inputEl.focus();
+});
+promptEl.addEventListener('input', () => {
+  const p = preset(personaEl.value);
+  // Editing the preset's text makes it a custom prompt — silently sending the
+  // preset instead of what the box shows would be a lie.
+  if (p && p.slug !== 'custom' && p.slug !== 'none' && promptEl.value.trim() !== p.system) {
+    personaEl.value = 'custom';
+  }
+  refreshSysNote();
+});
+
 function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
+
+function setPerf(text) { perfEl.textContent = text; }
+function updateTotals() {
+  totalsEl.textContent = session.tokens + ' tokens · ' + session.replies + ' replies';
+}
+
+// ----------------------------------------------------- copy / clipboard
+async function copyText(text, btn) {
+  const label = btn.dataset.label || btn.textContent;
+  btn.dataset.label = label;
+  let ok = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch (e) { ok = false; }
+  if (!ok) {                      // http:// on the LAN is not a secure context
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch (e) { ok = false; }
+  }
+  btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+  btn.classList.toggle('ok', ok);
+  setTimeout(() => { btn.textContent = label; btn.classList.remove('ok'); }, 1300);
+}
+
+function extractCode(text) {
+  const out = [];
+  let m;
+  const fenced = /```[^\\n]*\\n([\\s\\S]*?)```/g;
+  while ((m = fenced.exec(text)) !== null) out.push(m[1].replace(/\\s+$/, ''));
+  if (!out.length) {              // one-liner fences: ```code```
+    const inline = /```([^`\\n]+?)```/g;
+    while ((m = inline.exec(text)) !== null) out.push(m[1].trim());
+  }
+  return out.join('\\n\\n');
+}
+
+function miniButton(label, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'mini';
+  b.textContent = label;
+  b.addEventListener('click', onClick);
+  return b;
+}
 
 function setBusy(b) {
   busy = b;
@@ -521,15 +802,27 @@ function addMsg(role, text) {
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.textContent = text;
+  const actions = document.createElement('div');
+  actions.className = 'actions';
   const meta = document.createElement('div');
   meta.className = 'meta';
+  const entry = { bubble, meta, actions, text: text || '', codeBtn: null };
+  actions.appendChild(miniButton(role === 'user' ? 'Copy' : 'Copy response',
+                                () => copyText(entry.text, actions.firstChild)));
+  if (role === 'assistant') {
+    const codeBtn = miniButton('Copy code', () => copyText(extractCode(entry.text) || entry.text, codeBtn));
+    codeBtn.style.display = 'none';        // only once the reply contains code
+    entry.codeBtn = codeBtn;
+    actions.appendChild(codeBtn);
+  }
   box.appendChild(bubble);
+  box.appendChild(actions);
   box.appendChild(meta);
   msg.appendChild(avatar);
   msg.appendChild(box);
   messagesEl.appendChild(msg);
   scrollBottom();
-  return { bubble, meta };
+  return entry;
 }
 
 async function send(text) {
@@ -539,13 +832,17 @@ async function send(text) {
   if (welcome) welcome.remove();
   inputEl.value = ''; autoresize();
   addMsg('user', text);
-  const { bubble, meta } = addMsg('assistant', '');
+  const entry = addMsg('assistant', '');
+  const { bubble, meta } = entry;
   const caret = document.createElement('span');
   caret.className = 'caret';
   bubble.appendChild(caret);
   setBusy(true);
   controller = new AbortController();
-  let acc = '';
+  const started = performance.now();
+  let live = 0;
+  let firstAt = null;
+  setPerf('0 tok · …');
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -555,6 +852,8 @@ async function send(text) {
         temperature: +tempEl.value,
         top_p: +toppEl.value,
         history: history,
+        persona: personaEl.value,
+        system: selectedSystem(),
       }),
       signal: controller.signal,
     });
@@ -562,6 +861,12 @@ async function send(text) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    const paint = () => {
+      caret.remove();
+      bubble.textContent = entry.text;   // safe: model text becomes a text node, never HTML
+      bubble.appendChild(caret);
+      scrollBottom();
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -572,25 +877,50 @@ async function send(text) {
         if (!line.trim()) continue;
         const ev = JSON.parse(line);
         if (ev.type === 'token') {
-          acc += ev.text;
-          caret.remove();
-          bubble.textContent = acc;      // safe: model text becomes a text node, never HTML
-          bubble.appendChild(caret);
-          scrollBottom();
+          entry.text += ev.text;
+          live++;
+          if (firstAt === null) firstAt = performance.now();
+          const el = (performance.now() - started) / 1000;
+          setPerf(live + ' tok · ' + (live / Math.max(el, 0.001)).toFixed(1) + ' tok/s · ' +
+                  el.toFixed(1) + 's');
+          if (ev.text.indexOf('```') >= 0 && entry.codeBtn) entry.codeBtn.style.display = '';
+          paint();
+        } else if (ev.type === 'tool') {
+          const info = ev.source === 'question'
+            ? '🧮 ' + ev.line + ' — computed locally, no model tokens'
+            : '🧮 calculator: ' + (ev.calls || []).join(', ');
+          meta.dataset.tool = info;
         } else if (ev.type === 'done') {
-          acc = ev.reply || acc;
-          bubble.textContent = acc || '(no reply — try a higher temperature)';
-          history.push({ user: text, assistant: acc });
-          let m = ev.n_tokens + ' tokens';
-          if (ev.tok_per_s) m += ' · ' + ev.tok_per_s + ' tok/s';
-          m += ' · temp ' + ev.temperature + ' · top-p ' + ev.top_p;
-          if (ev.stop_reason === 'stopped') m += ' · stopped';
-          else if (ev.stop_reason === 'context') m += ' · context limit';
-          if (ev.turns_dropped > 0) m += ' · dropped ' + ev.turns_dropped + ' old turn(s)';
-          meta.textContent = m;
+          entry.text = ev.reply || entry.text;
+          bubble.textContent = entry.text || '(no reply — try a higher temperature)';
+          history.push({ user: text, assistant: entry.text });
+          if (entry.codeBtn && extractCode(entry.text)) entry.codeBtn.style.display = '';
+          // ---- latency monitor: server numbers, not client-side guesswork ----
+          const parts = [];
+          if (ev.source === 'calculator') {
+            parts.push('0 model tokens · computed locally');
+          } else {
+            parts.push(ev.n_tokens + ' tokens');
+            if (ev.tok_per_s) parts.push(ev.tok_per_s + ' tok/s');
+            if (ev.elapsed_s != null) parts.push(ev.elapsed_s + ' s');
+            if (ev.first_token_s != null) parts.push('first token ' + ev.first_token_s + ' s');
+          }
+          if (ev.prompt_tokens) parts.push('prompt ' + ev.prompt_tokens + ' tok');
+          parts.push('temp ' + ev.temperature + ' · top-p ' + ev.top_p);
+          if (ev.stop_reason === 'stopped') parts.push('stopped');
+          else if (ev.stop_reason === 'context') parts.push('context limit');
+          if (ev.turns_dropped > 0) parts.push('dropped ' + ev.turns_dropped + ' old turn(s)');
+          if (meta.dataset.tool) parts.unshift(meta.dataset.tool);
+          meta.textContent = parts.join(' · ');
+          setPerf((ev.n_tokens || 0) + ' tok · ' + (ev.tok_per_s ? ev.tok_per_s + ' tok/s' : 'tool') +
+                  (ev.elapsed_s != null ? ' · ' + ev.elapsed_s + 's' : ''));
+          session.tokens += ev.n_tokens || 0;
+          session.replies++;
+          updateTotals();
         } else if (ev.type === 'error') {
           bubble.classList.add('error');
           bubble.textContent = '⚠ ' + ev.message;
+          setPerf('error');
         }
       }
     }
@@ -598,8 +928,11 @@ async function send(text) {
     if (err.name !== 'AbortError') {
       bubble.classList.add('error');
       bubble.textContent = '⚠ ' + (err.message || 'connection failed — is the server running?');
-    } else if (!acc) {
-      bubble.textContent = '';
+      setPerf('disconnected');
+    } else {
+      if (!entry.text) bubble.textContent = '';
+      const el = (performance.now() - started) / 1000;
+      setPerf('stopped after ' + live + ' tok · ' + el.toFixed(1) + 's');
     }
   } finally {
     caret.remove();
@@ -632,6 +965,12 @@ document.querySelectorAll('.example').forEach(btn => {
   btn.addEventListener('click', () => { inputEl.value = btn.textContent; send(); });
 });
 
+// Build the persona dropdown, then let /api/info (the server's own idea of the
+// default persona) override the value baked into the page.
+PERSONAS.forEach(p => personaEl.appendChild(new Option(p.label, p.slug)));
+selectPersona(DEFAULTS.persona || 'custom');
+updateTotals();
+
 (async function boot() {
   try {
     const res = await fetch('/api/info');
@@ -645,9 +984,19 @@ document.querySelectorAll('.example').forEach(btn => {
       tempEl.value = info.defaults.temperature; tempEl.dispatchEvent(new Event('input'));
       toppEl.value = info.defaults.top_p; toppEl.dispatchEvent(new Event('input'));
     }
+    // the server is the authority on the *default* persona (--persona/--system)
+    const serverPreset = PERSONAS.find(p => p.label === info.persona || p.name === info.persona);
+    if (serverPreset && !DEFAULTS.persona) selectPersona(serverPreset.slug);
+    else if (!DEFAULTS.persona && info.system) {
+      personaEl.value = 'custom';
+      promptEl.value = info.system;
+      refreshSysNote();
+    }
+    setPerf('idle');
   } catch (e) {
     document.getElementById('statusDot').className = 'dot bad';
     document.getElementById('statusText').textContent = 'server unreachable';
+    setPerf('offline');
   }
 })();
 </script>
@@ -742,12 +1091,16 @@ class Handler(BaseHTTPRequestHandler):
         gen = self.engine.stream_chat(
             payload.get("message", ""), payload.get("history"),
             payload.get("temperature", 0.8), payload.get("top_p", 0.9),
-            payload.get("max_tokens"))
+            payload.get("max_tokens"),
+            system=payload.get("system"), persona=payload.get("persona"))
         try:
             for kind, data in gen:
-                write({"type": kind, "text": data} if kind == "token"
-                      else dict({"type": kind}, **data) if isinstance(data, dict)
-                      else {"type": kind, "message": str(data)})
+                if isinstance(data, dict):       # done / tool payloads pass through
+                    write(dict({"type": kind}, **data))
+                elif kind == "token":
+                    write({"type": "token", "text": data})
+                else:                            # error: one human-readable string
+                    write({"type": kind, "message": str(data)})
         except (BrokenPipeError, ConnectionResetError):
             pass                             # client left; .close() cancels the worker
         finally:
@@ -755,12 +1108,42 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+def render_index(args, engine: ChatEngine | None = None) -> str:
+    """Fill the page's placeholders from the CLI defaults.
+
+    Kept as a function (not inline in run_stdlib) so tests can render and assert
+    on the real page — and so a missing placeholder is one obvious failure
+    instead of a stray `__TOKEN__` in the browser.
+    """
+    value = (getattr(engine, "default_persona_value", None) if engine is not None
+             else (args.system if getattr(args, "system", None) is not None
+                   else getattr(args, "persona", None)
+                   if getattr(args, "persona", None) is not None else personas.DEFAULT_SLUG))
+    preset = personas.get(value)
+    if preset is not None:
+        slug = preset.slug
+    elif not (value or "").strip() or str(value).strip().lower() == personas.NONE_SLUG:
+        slug = personas.NONE_SLUG               # "" and "none" both mean: send nothing
+    else:
+        slug = personas.CUSTOM_SLUG
+    _, system_text = personas.resolve(value)
+    tools_on = (getattr(engine, "tools_on", None) if engine is not None
+                else not getattr(args, "no_tools", False))
+    personas_json = json.dumps(personas.choices(), ensure_ascii=False).replace("<", "\\u003c")
+    return (INDEX_HTML
+            .replace("__APP_NAME__", APP_NAME)
+            .replace("__TEMP__", f"{args.temp:g}")
+            .replace("__TOPP__", f"{args.top_p:g}")
+            .replace("__PERSONAS_JSON__", personas_json)
+            .replace("__DEFAULT_PERSONA__", slug)
+            .replace("__DEFAULT_SYSTEM_JSON__", json.dumps(system_text, ensure_ascii=False)
+                     .replace("<", "\\u003c"))
+            .replace("__TOOLS__", "true" if tools_on else "false"))
+
+
 def run_stdlib(engine: ChatEngine, args) -> None:
     Handler.engine = engine
-    html = (INDEX_HTML.replace("__APP_NAME__", APP_NAME)
-                      .replace("__TEMP__", f"{args.temp:g}")
-                      .replace("__TOPP__", f"{args.top_p:g}"))
-    Handler.index_html = html.encode("utf-8")
+    Handler.index_html = render_index(args, engine).encode("utf-8")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True           # a stuck client must not block shutdown
     local = f"http://127.0.0.1:{args.port}"
@@ -806,14 +1189,30 @@ def build_gradio_app(engine: ChatEngine, args):
     """Build the gr.ChatInterface without launching (tests import this)."""
     import gradio as gr
 
-    def respond(message, history, temperature, top_p):
+    choices = personas.choices()
+    label_to_slug = {p["label"]: p["slug"] for p in choices}
+    default_label, default_system = personas.resolve(engine.default_persona_value)
+
+    def respond(message, history, temperature, top_p, persona, custom_system):
         if not str(message).strip():
             yield ""
             return
+        slug = label_to_slug.get(persona, personas.CUSTOM_SLUG)
+        preset = personas.get(slug)
+        custom = str(custom_system or "").strip()
+        if preset is not None and (not custom or custom == preset.system):
+            # dropdown says "Math Tutor" and the box was not edited: send the
+            # slug, so the server can attach the calculator hint itself.
+            system = None
+        elif custom:
+            system, slug = custom, personas.CUSTOM_SLUG   # free text wins
+        else:
+            system, slug = None, personas.NONE_SLUG       # empty box = no system turn
         acc = ""
         try:
             for kind, data in engine.stream_chat(message, gradio_history_to_pairs(history),
-                                                 temperature, top_p):
+                                                 temperature, top_p,
+                                                 system=system or None, persona=slug):
                 if kind == "token":
                     acc += data
                     yield acc            # ChatInterface re-renders on every yield = streaming
@@ -830,15 +1229,22 @@ def build_gradio_app(engine: ChatEngine, args):
         title=f"{APP_NAME} · local LLM",
         description=("A ~15 M-parameter Llama-style transformer trained from scratch with "
                      "INT8 weight quantization, running entirely on this machine. Responses stream token by token."),
-        examples=[["Hello! Who are you?", args.temp, args.top_p],
-                  ["Tell me a short story about a cat.", args.temp, args.top_p],
-                  ["What is 2 + 3?", args.temp, args.top_p],
-                  ["Why is the sky blue?", args.temp, args.top_p]],
+        # one value per input (message + additional_inputs), so gradio cannot
+        # complain about a short row on one release and not another
+        examples=[[question, args.temp, args.top_p, default_label, default_system]
+                  for question in ("Hello! Who are you?",
+                                   "Tell me a short story about a cat.",
+                                   "What is 12 * 4?",
+                                   "Why is the sky blue?")],
         additional_inputs=[
             gr.Slider(0.1, 1.5, value=args.temp, step=0.05, label="Temperature"),
             gr.Slider(0.1, 1.0, value=args.top_p, step=0.05, label="Top-P"),
+            gr.Dropdown(choices=[p["label"] for p in choices], value=default_label,
+                        label="System Prompt"),
+            gr.Textbox(value=default_system, lines=2, label="Prompt text (editable)",
+                       placeholder="Leave empty for no system prompt"),
         ],
-        additional_inputs_accordion="⚙ Sampling settings",
+        additional_inputs_accordion="⚙ Sampling & System Prompt",
         clear_btn="Clear Chat",
         flagging_mode="never",
         theme=(gr.themes.Soft() if hasattr(gr, "themes") else None),
@@ -887,6 +1293,15 @@ def main() -> None:
     ap.add_argument("--top-k", type=int, default=40, help="safety cap on top of top-p; 0 disables")
     ap.add_argument("--repeat-penalty", type=float, default=1.15, help="1.0 disables; small models loop without it")
     ap.add_argument("--seed", type=int, default=None, help="default: random seed per reply")
+    ap.add_argument("--persona", default=None, metavar="NAME",
+                    help="system prompt the page starts on: friendly (default), pirate, "
+                         "math, storyteller, none")
+    ap.add_argument("--system", default=None, metavar="TEXT",
+                    help="free-text system prompt the page starts on, overriding --persona "
+                         "('' for none); the dropdown can still change it per message")
+    ap.add_argument("--no-tools", dest="no_tools", action="store_true",
+                    help="disable the calculator hook (arithmetic goes back to the model, "
+                         "and <<calc: …>> markers are shown as written)")
     ap.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     ap.add_argument("--backend", choices=("auto", "gradio", "stdlib"), default="auto",
                     help="auto: gradio when importable, always with stdlib fallback")
@@ -915,11 +1330,9 @@ def main() -> None:
                     args.quantized = True
                     break
 
-    # Deferred so `--help` works with no torch installed; same wording as the CLI.
-    try:
-        import generate as cli
-    except Exception as e:
-        die(f"generate.py must be importable next to web_ui.py ({e})")
+    # `generate` is already imported at module level (stdlib-only: it is where
+    # serialize_chat lives); everything below needs torch, which is deferred so
+    # `--help` still works on a machine without it.
     torch = cli.import_torch()
     from _stage import load as _load        # noqa: E402  (needs torch already importable)
     model_mod, gen_mod = _load("03_model"), _load("06_generate")
@@ -986,7 +1399,15 @@ def main() -> None:
           f"{ckpt.stat().st_size / 1e6:.1f} MB){qtag}")
     print(f"[web] config {cfg_path}  ({cfg.n_layer} layers, {cfg.n_head} heads, "
           f"d_model {cfg.d_model}, context {cfg.block_size}, vocab {cfg.vocab_size})")
-    print(f"[web] tokenizer {tok_dir}  (vocab {tok.vocab})", flush=True)
+    print(f"[web] tokenizer {tok_dir}  (vocab {tok.vocab})")
+    system_label, system_text = personas.resolve(
+        args.system if args.system is not None else args.persona,
+        tool_hint=engine.tools_on)
+    n_system = len(tok.encode_with_specials(system_text, [IM_START, IM_END])) if system_text else 0
+    print(f"[web] system prompt: {system_label}"
+          + (f"  ({n_system} tokens)" if n_system else "  (none)"))
+    print(f"[web] calculator hook: {'on' if engine.tools_on else 'off'} "
+          f"(tools.py; --no-tools disables)", flush=True)
 
     use_gradio = args.backend in ("auto", "gradio")
     if use_gradio:

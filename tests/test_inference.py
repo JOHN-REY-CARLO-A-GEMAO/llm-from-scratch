@@ -96,6 +96,75 @@ class SamplingTests(unittest.TestCase):
             forward.assert_not_called()
 
 
+class ChatPromptTests(unittest.TestCase):
+    """System prompts and the calculator hook, on the CLI side."""
+
+    def test_serialize_chat_is_the_single_template_both_frontends_use(self):
+        import personas
+        import web_ui
+        turns, user = [("hi", "hello there")], "how are you?"
+        expected = ("<|im_start|>system\nbe nice<|im_end|>\n"
+                    "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+                    "hello there<|im_end|>\n"
+                    "<|im_start|>user\nhow are you?<|im_end|>\n<|im_start|>assistant\n")
+        self.assertEqual(cli.serialize_chat("be nice", turns, user), expected)
+        self.assertEqual(expected, web_ui.ChatEngine.serialize(None, turns, user, "be nice"))
+        # the system turn is optional and, when absent, the framing is byte-for-byte
+        # what 08_sft.py trained on
+        self.assertEqual(cli.serialize_chat(personas.resolve("none")[1], turns, user),
+                         expected.replace("<|im_start|>system\nbe nice<|im_end|>\n", ""))
+
+    def test_initial_system_defaults_to_friendly_and_system_wins(self):
+        from types import SimpleNamespace
+        default = cli.initial_system(SimpleNamespace(persona=None, system=None, no_tools=False))
+        self.assertEqual(default[0], cli.personas.default().label)
+        pirate = cli.initial_system(SimpleNamespace(persona="pirate", system=None, no_tools=False))
+        self.assertEqual(pirate[0], "🏴‍☠️ Pirate")
+        custom = cli.initial_system(SimpleNamespace(persona="pirate", system="be a robot",
+                                                    no_tools=False))
+        self.assertEqual(custom, ("Custom", "be a robot"))
+        off = cli.initial_system(SimpleNamespace(persona="none", system=None, no_tools=False))
+        self.assertEqual(off, ("None", ""))
+        # --no-tools drops the math tutor's calculator hint
+        hinted = cli.initial_system(SimpleNamespace(persona="math", system=None, no_tools=False))
+        bare = cli.initial_system(SimpleNamespace(persona="math", system=None, no_tools=True))
+        self.assertIn("<<calc:", hinted[1])
+        self.assertNotIn("<<calc:", bare[1])
+
+    def test_token_stream_substitutes_tool_calls_only_when_enabled(self):
+        import tools
+        tok = tm.ByteLevelBPE.load(ROOT / "tokenizer/chat")
+        ids = tok.encode_with_specials("5 + 5 = <<calc: 5 + 5>>",
+                                      [cli.IM_START, cli.IM_END])
+        for filter_on in (True, False):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                stream = cli.TokenStream(tok, tm.unicode_to_bytes,
+                                         tools.ToolTextFilter() if filter_on else None)
+                for token_id in ids:
+                    stream(token_id)
+                stream.finish()
+            expected = "5 + 5 = 10" if filter_on else "5 + 5 = <<calc: 5 + 5>>"
+            self.assertEqual(output.getvalue(), expected)
+            self.assertEqual("".join(stream.written), expected)   # history == display
+
+    def test_chat_repl_end_to_end_with_persona_system_prompt_and_math(self):
+        """The whole path: CLI flags, REPL commands, exact arithmetic."""
+        args = [sys.executable, str(ROOT / "generate.py"), "--chat", "--n", "2",
+                "--threads", "2", "--seed", "4294967295"]
+        script = "5 + 5\n/persona\n/persona pirate\n/system Custom robot.\n/system\n/exit\n"
+        result = subprocess.run(args, cwd=ROOT, input=script, capture_output=True,
+                                text=True, check=True)
+        out = result.stdout
+        self.assertIn("Assistant> 5 + 5 = 10", out)          # 5 + 5 is 10, always
+        self.assertIn("the model was not asked", out)
+        self.assertIn("[chat] system prompt: 🤖 Friendly Assistant", out)
+        self.assertIn("[chat] system prompt: 🏴‍☠️ Pirate", out)
+        self.assertIn("[chat] system prompt: Custom", out)
+        self.assertIn("Custom robot.", out)
+        self.assertIn("Presets: friendly", out)              # /persona with no argument lists
+
+
 class InferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
