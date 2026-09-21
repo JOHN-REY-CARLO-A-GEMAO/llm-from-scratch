@@ -124,3 +124,69 @@ byte-for-byte after an accidental `rm`).
   tokenisation, so no val token is in any training block. The 20 MB corpus was itself
   deduplicated by content hash — duplicated data inflates apparent quality, and the
   first candidate copy of the dataset found in the wild was 98% duplicates.
+
+## The chat fine-tune (`out/model_15m_chat.pt`)
+
+`08_sft.py` continues this recipe on the 15 M-parameter checkpoint with a
+response-only loss (user text, role markers, prior turns and padding are `-100`),
+and the corpus carries three things the base model never saw: `<think> … </think>`
+reasoning traces on questions that need several steps, `<<calc: …>>` /
+`<<tool: …>>` markers whose arithmetic is substituted by `tools.py` at inference
+time, and `rag.context_block`-formatted document passages in a system turn.
+Measured on this machine, and reproducible from the command recorded in
+`out/chat_run_config.json`:
+
+| check | what it measures | result |
+|---|---|---|
+| validation loss | held-out rows, assistant tokens only | see `best_val_loss` in `out/chat_run_config.json` |
+| `--cot-check 3` | greedy reply opens *and closes* a `<think>` block on complex questions | see `cot_check` |
+| `--doc-check 3` | questions about **two** subjects that appear nowhere in training, answered from an injected passage — one series in the corpus's sentence shapes, one in shapes no training row uses, plus a question the passage cannot answer | see `doc_check` |
+
+Honest limits, in the same register as the base model's:
+
+- **The trace is a format, not a proof.** The steps are numbered, ordered and
+  parsed by the UI, but the arithmetic *inside* a trace is only exact where the
+  model used a `<<calc: …>>` marker — a 7 M-parameter model is a poor calculator,
+  and the corpus deliberately teaches it to hand the arithmetic to a tool.
+- **Document reading is the weak spot, and it is measured.** `--doc-check 3`
+  hands the model a passage about a subject that appears *nowhere* in training
+  and asks about it; the honest result on this checkpoint is in
+  `out/chat_run_config.json`, and it is a partial pass at best. The three
+  measurements behind that number:
+  *(1)* the model reproduces a **training** passage exactly (replaying a row's
+  own prefix recovers its recorded answer), so what looks like reading can be
+  recall;
+  *(2)* the same model, trained on the document family **alone** for 400 steps to
+  a validation loss of 0.0015, still could not copy a held-out passage — it
+  answered "The document does not say." So in-context copying did not emerge at
+  this scale; it is a capacity/data-scale limit, not a mixture accident. The
+  shipped run scores 2/8 on `--doc-check` (both honest refusals, none of the six
+  held-out facts), and a live session shows the split exactly: asked where the
+  marlow lives in a document that says *the tall grass of the Plain of Tesh*, it
+  answers "The cobb lives in the still water of the Mere." — right shape, wrong
+  source, `grounding` 0.19;
+  *(3)* the corpus was therefore rebuilt to make recall useless — names and facts
+  are paired at random across rows, sentences are shuffled next to a second
+  creature's, and the check uses two held-out subjects and one series of sentence
+  shapes no training row contains.
+  The practical consequence for the UI: the retrieved passage is always shown
+  next to the reply (sources card) and a reply that shares almost nothing with it
+  is flagged. Document Q&A is useful because the *retrieval* is exact and the
+  passage is on screen; the 7 M-parameter model reading it is the part that fails.
+- **Grounding is measured, not promised.** The share of the reply's content words
+  that appear in the retrieved passage is reported (`grounding`), and the page
+  warns when a reply shares almost nothing with the document. A well-phrased
+  paraphrase can score low; a memorised answer can score high.
+- **No system-prompt obedience.** The corpus trains two system blocks (the
+  document context and the reasoner/math hints); arbitrary prose in that slot
+  steers tone and vocabulary, not capability.
+- **Selection effects.** `--cot-pins`/`--doc-pins` deliberately overweight a
+  handful of examples. That is a curriculum, not the natural distribution, and
+  the checks above are the price of it: results are reported whether they pass
+  or fail.
+- **The documents are invented, and the check knows it.** The document rows teach
+  a *skill* — find the sentence, copy it, or say the document does not say — on
+  invented creatures and places, and their facts are paired with names at random
+  across rows so there is no table to memorize. The held-out values in
+  `--doc-check 3` are the same kind of invented fact: they measure whether the
+  model reads the passage it was handed, not whether it knows the world.

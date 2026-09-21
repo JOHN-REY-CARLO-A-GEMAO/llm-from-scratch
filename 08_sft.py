@@ -3,6 +3,38 @@
 Only response tokens (including ``<|im_end|>``) contribute to cross entropy.
 User text, role markers, and right padding use label -100. Two chat markers are
 appended to the existing tokenizer, preserving every pretrained token id.
+
+## Chain-of-thought
+
+`07_make_sft.py` writes reasoning traces (`<think> … </think>`, see
+`personas.wrap_think`) for the questions that need more than one step, and a
+direct answer for the ones that do not. Three things make that stick in a 7 M
+parameter model:
+
+ * **Volume.** Roughly a third of the corpus carries a trace, over several
+   phrasings of the same three moves, so the block is a habit rather than a
+   memorised string.
+ * **A pinned curriculum.** `--cot-pins` repeats a handful of reasoned examples
+   (one explanation, one word problem, one comparison) until they are a
+   meaningful share of the batch: a small model drifts back to its pretrained
+   "answer immediately" prior without them.
+ * **A check, not a hope.** `--cot-check` generates a reply to a few complex
+   questions with the reasoner persona after training and reports whether a
+   *closed* `<think>` block came out. The result is written to
+   `chat_run_config.json` (`cot_check`), because "the model reasons now" is a
+   claim that has to be reproducible.
+
+## Document grounding
+
+Some corpus rows carry a *system* turn holding a
+`rag.context_block`-formatted passage, and the answer is only in that passage
+(`07_make_sft.py`). `encode_example` therefore takes an optional `system` text
+and serializes the system turn in front of the user turn, exactly as
+`generate.serialize_chat` does at inference time. `--doc-check` then asks a
+question about an entity that appears **nowhere** in training, with the passage
+that answers it injected: a reply that reuses the passage's words is a
+fine-tune that reads its context, and one that invents a habitat is a
+fine-tune that does not. Both are recorded (`doc_check`), not asserted.
 """
 from __future__ import annotations
 
@@ -19,6 +51,8 @@ import torch
 import torch.nn.functional as F
 
 from _stage import load
+import personas
+import rag                                    # stdlib-only, torch-free
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -36,9 +70,15 @@ def make_chat_tokenizer(base_dir: Path, output_dir: Path):
     return base
 
 
-def encode_example(tok, prompt: str, response: str, block_size: int):
+def encode_example(tok, prompt: str, response: str, block_size: int, system: str | None = None):
+    """One supervised turn. `system` is the document/persona block in front of it.
+
+    Nothing about the system turn is supervised: it is context, like the user
+    turn, and only the assistant tokens (and its `<|im_end|>`) carry a label.
+    """
     specials = [IM_START, IM_END]
-    prefix = f"{IM_START}user\n{prompt}{IM_END}\n{IM_START}assistant\n"
+    head = f"{IM_START}system\n{system}{IM_END}\n" if system else ""
+    prefix = head + f"{IM_START}user\n{prompt}{IM_END}\n{IM_START}assistant\n"
     full = prefix + response + IM_END
     prefix_ids = tok.encode_with_specials(prefix, specials)
     ids = tok.encode_with_specials(full, specials)
@@ -114,6 +154,160 @@ def evaluate(model, rows, indices, batch_size, pad_id, device, amp):
     return total / tokens
 
 
+#: A held-out entity for `--doc-check`: it appears in no training row, so an
+#: answer that names its habitat got it from the injected passage.
+#: How many new tokens the grounding check may sample. 96 is enough for a short
+#: answer plus a trace, and it leaves the passage most of the 256-token window.
+DOC_CHECK_TOKENS = 96
+#: Tokens the check allows for the reply (the frontends allow more; this is a cap,
+#: not the model's limit).
+DOC_CHECK_REPLY_TOKENS = 64
+
+#: Two held-out subjects, neither of which appears in any training row. The first
+#: is checked with the *same* sentence shapes the corpus uses, the second with
+#: shapes (`DOC_ALT_*` in 07_make_sft.py) no training row ever shows. A model
+#: that parrots the shape it learned passes the first and fails the second; a
+#: model that reads the passage passes both, which is the difference between a
+#: document feature and a template.
+#: `(series, entity, (home, food, sound), sentence templates, questions)`.
+DOC_CHECK_SERIES = (
+    ("trained shapes", "wobbin",
+     ("the salt flats of Grim", "amber seeds", "a low wooden knock"),
+     ("The {name} lives in {value}.", "The {name} eats {value}.",
+      "The {name} makes {value}."),
+     ("Where does the {name} live?", "What does the {name} eat?",
+      "What sound does the {name} make?")),
+    ("unseen shapes", "gorlin",
+     ("the cold spring of Havn", "bitter cloudberries", "a single ringing note"),
+     ("You can find the {name} in {value}.", "The {name} feeds on {value}.",
+      "The {name} calls out with {value}."),
+     ("Where can I find the {name}?", "What is the food of the {name}?",
+      "What noise does the {name} make?")),
+)
+#: A question the passage cannot answer, per series: the trained reply is the
+#: honest one. It is checked too, because "always copy something" and "never copy
+#: anything" fail in opposite directions and each looks fine on the other's test.
+DOC_CHECK_MISSING = ("What colour is the {name}?", "What colour is the {name}?")
+
+
+@torch.no_grad()
+def check_grounding(model, tok, cfg, device, args) -> dict | None:
+    """Ask about held-out subjects with their passages injected as the system turn.
+
+    The reply is graded against the passage: a hit is the passage's own words
+    coming back out. This is the cheapest honest test of "does the checkpoint use
+    the retrieved context, or does it answer from its prior" — and the first
+    version of the corpus failed it, which is why the *values* are held out here
+    and the second series changes the sentence shapes as well.
+    """
+    gen_mod = load("06_generate")
+    import rag                                    # stdlib-only, torch-free
+
+    cost = lambda text: len(tok.encode_with_specials(text, [IM_START, IM_END]))   # noqa: E731
+    end_id = tok.token_to_id[IM_END]
+    params = gen_mod.SamplingParams(temperature=0.0, top_k=1, top_p=1.0,
+                                    repeat_penalty=1.0, seed=0)
+    was_training = model.training
+    model.eval()
+
+    def ask(passage: str, question: str) -> tuple[str, int]:
+        index = rag.DocumentIndex.from_text(passage, name="held-out.txt")
+        system, hits = index.context_block(question,
+                                           cfg.block_size - DOC_CHECK_TOKENS, cost, top_k=1)
+        text = (f"{IM_START}system\n{system}{IM_END}\n" if system else "") + \
+               f"{IM_START}user\n{question}{IM_END}\n{IM_START}assistant\n"
+        ids = tok.encode_with_specials(text, [IM_START, IM_END])
+        # 64 tokens, not half the passage budget: a document question may open a
+        # `\u003cthink\u003e` block first, and a check that cuts the reply off mid-trace
+        # measures its own budget rather than the model. 96 + 64 still leaves the
+        # 256-token window room to spare.
+        out, _, _ = gen_mod.generate(model, ids, DOC_CHECK_REPLY_TOKENS, params, use_cache=True,
+                                     eos_id=end_id, device=device, block_size=cfg.block_size)
+        reply = tok.decode(out[len(ids):]).strip()
+        for marker in personas.MARKERS:          # control markers are not prose
+            reply = reply.replace(marker, "")
+        return reply, len(hits)
+
+    series_rows: list[dict] = []
+    for (label, name, values, templates, questions), missing in zip(
+            DOC_CHECK_SERIES, DOC_CHECK_MISSING):
+        passage = " ".join(template.format(name=name, value=value)
+                           for template, value in zip(templates, values))
+        rows: list[dict] = []
+        for question, expected in zip(questions, values):
+            asked = question.format(name=name)
+            reply, retrieved = ask(passage, asked)
+            thought = personas.split_think(reply)
+            answer = thought.answer or thought.reasoning
+            graded = rag.grounding(answer, passage)
+            copied = bool(graded is not None and graded >= 0.5)
+            rows.append({"question": asked, "reply": reply, "expected": expected,
+                         "retrieved": retrieved, "grounding": graded, "copied": copied})
+            print(f"[sft] {'OK ' if copied else 'NO '}[{label}] {asked!r} -> {reply[:110]!r} "
+                  f"(expected {expected!r}, grounding={graded})")
+        asked = missing.format(name=name)
+        reply, _ = ask(passage, asked)
+        refused = "does not say" in reply.lower()
+        rows.append({"question": asked, "reply": reply, "expected": "(refusal)",
+                     "retrieved": 1, "grounding": None, "copied": refused})
+        print(f"[sft] {'OK ' if refused else 'NO '}[{label}] {asked!r} -> {reply[:110]!r} "
+              f"(expected the honest refusal)")
+        series_rows.append({"series": label, "entity": name, "passage": passage, "rows": rows,
+                            "copied": sum(1 for row in rows if row["copied"]),
+                            "asked": len(rows)})
+    if was_training:
+        model.train()
+    return {"series": series_rows,
+            "copied": sum(entry["copied"] for entry in series_rows),
+            "asked": sum(entry["asked"] for entry in series_rows)}
+
+
+COT_CHECK_PROMPTS = (
+    "Why does it rain?",
+    "Sam has 12 marbles, gets 4 more, and gives 6 away. How many marbles does Sam have?",
+    "Is 7 + 5 bigger than 45?",
+)
+
+
+@torch.no_grad()
+def check_reasoning(model, tok, cfg, device, args) -> list[dict]:
+    """Greedily answer a few *complex* questions and report the `<think>` status.
+
+    Greedy on purpose: sampling a reasoning block and calling it a format check
+    would be a coin toss. The persona hint is attached (that is what the browser
+    sends for the reasoner preset) but the questions are the ones the corpus
+    taught, so this measures the fine-tune, not the system prompt.
+    """
+    gen_mod = load("06_generate")
+    label, system = personas.resolve("reasoner")
+    specials = [IM_START, IM_END]
+    end_id = tok.token_to_id[IM_END]
+    was_training = model.training
+    model.eval()
+    report: list[dict] = []
+    for prompt in COT_CHECK_PROMPTS[:max(0, args.cot_check)]:
+        text = (f"{IM_START}system\n{system}{IM_END}\n"
+                if system else "") + f"{IM_START}user\n{prompt}{IM_END}\n{IM_START}assistant\n"
+        ids = tok.encode_with_specials(text, specials)
+        ids = ids[-(cfg.block_size - 1):]
+        params = gen_mod.SamplingParams(temperature=0.0, top_k=1, top_p=1.0,
+                                        repeat_penalty=1.0, seed=0)
+        out, _, _ = gen_mod.generate(model, ids, 160, params, use_cache=True,
+                                     eos_id=end_id, device=device,
+                                     block_size=cfg.block_size)
+        reply = tok.decode(out[len(ids):]).strip()
+        for marker in personas.MARKERS:          # control markers are not prose
+            reply = reply.replace(marker, "")
+        thought = personas.split_think(reply)
+        report.append({"prompt": prompt, "reply": reply, "system": label,
+                       "reasoning": thought.reasoning, "answer": thought.answer,
+                       "closed": thought.closed and thought.has_reasoning,
+                       "reasoning_chars": len(thought.reasoning)})
+    if was_training:
+        model.train()
+    return report
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Instruction-tune TinyStories as a small chatbot")
     ap.add_argument("--data", default="data/sft/chat_sft.jsonl")
@@ -132,6 +326,16 @@ def main() -> None:
     ap.add_argument("--val-examples", type=int, default=256)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--autocast", choices=["none", "bf16"], default="none")
+    ap.add_argument("--cot-pins", type=int, default=96,
+                    help="repeats per pinned chain-of-thought example (0 disables)")
+    ap.add_argument("--cot-check", type=int, default=3,
+                    help="questions to sample greedily after training to verify the "
+                         "<think> format (0 disables)")
+    ap.add_argument("--doc-check", type=int, default=3,
+                    help="document questions to sample greedily after training, with "
+                         "a held-out passage injected (0 disables)")
+    ap.add_argument("--doc-pins", type=int, default=64,
+                    help="repeats per pinned document-grounding example (0 disables)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -141,7 +345,6 @@ def main() -> None:
     amp = args.autocast == "bf16"
 
     tok = make_chat_tokenizer(Path(args.tokenizer), Path(args.chat_tokenizer))
-    tok_mod = load("01_tokenizer")
     model_mod = load("03_model")
     old_cfg = model_mod.GPTConfig.load(args.config)
     cfg = replace(old_cfg, vocab_size=tok.vocab)
@@ -159,7 +362,12 @@ def main() -> None:
           f"loaded {args.model}")
 
     raw = [json.loads(line) for line in Path(args.data).read_text(encoding="utf-8").splitlines() if line]
-    singles = [encode_example(tok, r["prompt"], r["response"], cfg.block_size) for r in raw]
+    reasoned = sum(1 for row in raw
+                   if personas.THINK_OPEN in row.get("response", "")
+                   or row.get("reasoning"))
+    print(f"[sft] {len(raw):,} examples, {reasoned:,} with a {personas.THINK_OPEN} trace")
+    singles = [encode_example(tok, r["prompt"], r["response"], cfg.block_size,
+                              r.get("system") or None) for r in raw]
     order = list(range(len(singles)))
     random.Random(args.seed).shuffle(order)
     nval = min(args.val_examples, max(1, len(singles) // 20))
@@ -170,11 +378,63 @@ def main() -> None:
     # role-boundary recovery and makes retained REPL history useful rather than
     # causing the model to continue answering the oldest user. Pin the requested
     # verification exchange several times as a tiny regression curriculum.
-    for i in range(0, len(train_raw) - 1, 2):
-        train_rows.append(encode_conditioned(tok, train_raw[i], train_raw[i + 1], cfg.block_size))
+    plain = [r for r in train_raw if not r.get("system")]
+    for i in range(0, len(plain) - 1, 2):
+        train_rows.append(encode_conditioned(tok, plain[i], plain[i + 1], cfg.block_size))
     hello = {"prompt": "Hello! Who are you?", "response": "Hello! I am a small, friendly assistant. I can answer simple questions and tell little stories."}
     frog = {"prompt": "Can you tell me a story about a frog?", "response": "Once there was a little green frog named Pip. Pip was afraid to leap across a stream. A kind dragonfly said, ‘Try one small jump.’ Pip jumped, landed on a lily pad, and smiled. Soon he crossed the whole stream, one brave hop at a time."}
     train_rows.extend(encode_conditioned(tok, hello, frog, cfg.block_size) for _ in range(256))
+    # Chain-of-thought curriculum: the *format* is the lesson, so a few examples
+    # are repeated far beyond their natural frequency. Without this a 7 M model
+    # regresses to the pretrained habit of answering immediately.
+    if args.cot_pins > 0:
+        reasoned_rows = [r for r in train_raw if personas.THINK_OPEN in r["response"]]
+        greetings = [r for r in train_raw if personas.THINK_OPEN not in r["response"]]
+        for i, row in enumerate(reasoned_rows[:3]):
+            train_rows.extend(encode_example(tok, row["prompt"], row["response"], cfg.block_size)
+                              for _ in range(args.cot_pins))
+        # ...and one *direct* example, pinned the same way, so "think" does not
+        # become "always think": the trace is a response to the question, not a
+        # prefix on every reply.
+        if greetings:
+            row = greetings[0]
+            train_rows.extend(encode_example(tok, row["prompt"], row["response"], cfg.block_size)
+                              for _ in range(args.cot_pins // 2))
+        print(f"[sft] pinned chain-of-thought examples: "
+              f"{sum(1 for r in train_raw if personas.THINK_OPEN in r['response']):,} reasoned rows "
+              f"in the pool; {args.cot_pins} repeats each")
+    # Document grounding curriculum: the same argument as the CoT pins. One
+    # answer-from-the-passage example and one "the document does not say"
+    # example, repeated, so the injected block is never wallpaper.
+    if args.doc_pins > 0:
+        # document rows only: `system` is also used for persona rows, and pinning
+        # a persona greeting as "document grounding" would teach the wrong block
+        grounded = [r for r in train_raw
+                    if (r.get("system") or "").startswith(rag.DOC_HEADER)]
+        answers = [r for r in grounded if "does not say" not in r["response"]]
+        refusals = [r for r in grounded if "does not say" in r["response"]]
+        # Two answering rows get the full weight and the refusal gets half of it:
+        # the copy task is the hard one, and a refusal pinned as hard as an answer
+        # is how the first version of these rows taught the model to answer
+        # "The document does not say." to everything with a document loaded.
+        #
+        # Which two? The *longest* copies, and the first refusal the file holds.
+        # A pinned row is seen ~64 times, so a short one ("It makes a soft
+        # fluting song") would be memorized outright and would teach that a
+        # document answer is a sentence fragment: sort by length so the pin is a
+        # whole sentence whose value cannot be produced without reading it.
+        answers = sorted(answers, key=lambda r: (-len(r["response"]), r["prompt"]))
+        for row in answers[:2]:
+            train_rows.extend(
+                encode_example(tok, row["prompt"], row["response"], cfg.block_size,
+                               row["system"]) for _ in range(args.doc_pins))
+        for row in refusals[:1]:
+            train_rows.extend(
+                encode_example(tok, row["prompt"], row["response"], cfg.block_size,
+                               row["system"]) for _ in range(args.doc_pins // 2))
+        print(f"[sft] pinned document-grounding examples: {len(grounded):,} grounded rows "
+              f"({len(answers):,} answering, {len(refusals):,} refusing) in the pool; "
+              f"{args.doc_pins} repeats per answer, {args.doc_pins // 2} per refusal")
     rows = train_rows + val_rows
     train_idx = list(range(len(train_rows)))
     val_idx = list(range(len(train_rows), len(rows)))
@@ -226,12 +486,31 @@ def main() -> None:
                 torch.save(model.state_dict(), out)
                 print(f"[sft] new best -> {out}")
 
+    # ---- chain-of-thought check: does the fine-tune actually emit a trace? ----
+    cot_report = check_reasoning(model, tok, cfg, device, args) if args.cot_check > 0 else None
+    if cot_report:
+        for row in cot_report:
+            flag = "OK " if row["closed"] else "NO "
+            print(f"[sft] {flag}{row['prompt']!r} -> {row['reply'][:120]!r}")
+        ok = sum(1 for row in cot_report if row["closed"])
+        print(f"[sft] reasoning check: {ok}/{len(cot_report)} replies opened *and* closed "
+              f"a {personas.THINK_OPEN} block")
+
+    doc_report = check_grounding(model, tok, cfg, device, args) if args.doc_check > 0 else None
+    if doc_report:
+        for entry in doc_report["series"]:
+            print(f"[sft] document check [{entry['series']}]: "
+                  f"{entry['copied']}/{entry['asked']} replies reused the injected passage")
+        print(f"[sft] document check: {doc_report['copied']}/{doc_report['asked']} replies "
+              f"reused the injected passage")
+
     config_path = out.with_name(out.stem + "_config.json")
     config_path.write_text(json.dumps(asdict(cfg), indent=2))
     log_path.write_text("\n".join(json.dumps(row) for row in history) + "\n")
     run_path = out.with_name("chat_run_config.json")
     run_path.write_text(json.dumps({**vars(args), "vocab_size": cfg.vocab_size,
-                                    "best_val_loss": best,
+                                    "best_val_loss": best, "cot_check": cot_report,
+                                    "doc_check": doc_report,
                                     "seconds": time.time() - started}, indent=2))
     print(f"[sft] done; best validation loss={best:.4f}; wrote {out} and {config_path}")
 

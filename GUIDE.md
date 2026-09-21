@@ -876,10 +876,13 @@ Five things worth stealing from production recipes:
 
 ## 11. System prompts, personas, and tool use
 
-Two features sit between the sampler and the user, and both exist because of the
-same observation: **a chat model is a text completer, and some of the text it is
-asked to produce is not text at all.** Tone is best steered with prompt text;
-arithmetic is not — so tone is a prompt and arithmetic is a program.
+Four features sit between the sampler and the user, and all four exist because of
+the same observation: **a chat model is a text completer, and some of the text it
+is asked to produce is not text at all.** Tone is best steered with prompt text;
+arithmetic is not — so tone is a prompt and arithmetic is a program. Reasoning
+is text, so it is *trained* — as a marked-up block the program can find, split
+and render. And "answer from this document" is retrieval plus a fixed template,
+not something to hope the weights learned.
 
 ### 11.1 The system turn
 
@@ -901,15 +904,21 @@ the browser cannot drift: identical tone steering, identical token boundaries,
 identical trimming behaviour. `tests/test_web_ui.py` asserts that
 `ChatEngine.serialize` *is* `serialize_chat`.
 
-Four presets ship (Friendly Assistant — the default, Pirate, Math Tutor,
-Storyteller), plus free text and an explicit "none". Three details are deliberate:
+Five presets ship (Friendly Assistant — the default, Pirate, Math Tutor,
+Storyteller, Reasoner), plus free text and an explicit "none". Four details are
+deliberate:
 
-* **Honesty about the effect.** The fine-tune never saw a system turn. A system
-  prompt here is conditioning *text*, not an instruction channel the model was
-  trained to obey: at 1.9–15 M parameters expect a change of tone and vocabulary,
-  not of capability. That is what the docstring says, and it is also why
-  `personas.resolve("none")` is a first-class option — it reproduces exactly the
-  framing the checkpoint was fine-tuned on.
+* **Honesty about the effect.** Tone presets are conditioning *text*, not an
+  instruction channel the model was trained to obey: at 7 M parameters expect a
+  change of tone and vocabulary, not of capability. Two presets are different,
+  because the corpus trains the behaviour they ask for: `math` attaches
+  `personas.CALC_HINT` ("write `<<calc: 5 + 5>>` and the exact result is
+  substituted") and `reasoner` attaches `COT_HINT` (plan inside
+  `<think> … </think>` first). 300 corpus rows and a pinned curriculum teach the
+  marker, 2,296 teach the trace, and ~590 more repeat ordinary rows with each
+  preset's real text in front of them, so the *default* path (Friendly Assistant,
+  no thinking hint) is a prompt the model has actually seen. `personas.resolve("none")` is still a
+  first-class option — it reproduces exactly the framing most of the corpus used.
 * **Marker stripping.** `personas.sanitize()` deletes `<|im_start|>`,
   `<|im_end|>`, `<|doc_end|>` and `<|endoftext|>` from anything a human typed —
   in the system prompt, in the message, and in echoed history. Without it, the
@@ -970,6 +979,164 @@ operators (`12 times 4`, `20% of 80`) and typographic operators (`×`, `÷`, `�
 are normalised first; `--no-tools` turns the whole hook off, which is the honest
 way to see what the model does without it.
 
+### 11.3 Chain-of-thought
+
+The cheapest way to get a small model to answer a multi-step question better is
+to make it write the steps down first, because every step becomes context for the
+next token. The catch is that "write the steps down" has to be *legible to the
+program*, or the user reads a paragraph of working-out before the answer they
+wanted. So the trace is a marked block:
+
+```text
+<think>
+1. Identify the core question: why does it rain.
+2. Check the key facts: water warms, rises into the sky, and cools into tiny drops.
+3. Put the facts together and answer in one or two short sentences.
+</think>
+Water warms, rises into the sky, and cools into tiny drops in clouds. …
+```
+
+Four decisions are worth defending:
+
+* **The markers are plain text, not added tokens.** The chat tokenizer's only
+  added tokens stay `<|im_start|>`/`<|im_end|>` (4096 → 4098). Adding
+  `<think>`/`</think>` as *tokens* would mean a second vocabulary expansion, a
+  second embedding row per marker, and a tokenizer artifact that no longer
+  matches the base one for no real gain — byte-level BPE already encodes each
+  marker in a handful of bytes, and a model that has to *spell* the marker is
+  exactly as predictable as one that samples a dedicated token.
+* **Traces are selective.** Only questions that need more than one step get one
+  (why-questions, word problems, comparisons, document questions); greetings,
+  one-fact answers and `5 + 5` do not. A corpus where every reply opens with
+  `<think>` teaches a prefix, not a decision. `08_sft.py --cot-pins 96` repeats
+  three reasoned rows and one direct row through training for the same reason —
+  a 7 M model drifts back to "answer immediately" without the extra weight, and
+  the pinned *direct* row is what stops the trace from becoming unconditional.
+* **Parsing is one function, used twice.** `personas.split_think()` is the
+  definition (`reasoning`, `answer`, `closed`), and
+  `personas.ThinkStreamFilter` is the streaming view of it — implemented as the
+  **delta of two monotone streams** rather than a second state machine, so the
+  browser, the terminal and the tests cannot disagree about the same reply. The
+  browser needs its own copy anyway (it is JavaScript), so the parity is a unit
+  test: `tests/test_web_ui.py` extracts `splitThink`/`stripThink` from the real
+  page and runs both implementations over the same replies in node.
+* **`closed` is reported, not guessed.** A reply that was cut off by the context
+  limit mid-trace has no `</think>`; the honest state is `closed: false`, which
+  the UI renders as "🧠 Thinking…" and the meta line as "(unclosed)". Text before
+  the opening marker is kept as part of the answer instead of being discarded:
+  a model that writes "Let me work this out. `<think>…`" has said something, and
+  hiding it would hide a formatting failure rather than show it.
+
+The measured result (greedy, `--cot-check 3`, recorded in
+`out/chat_run_config.json`) is in the README: the format is reliable, the
+*arithmetic inside* the trace is not — which is why the corpus also teaches the
+model to put the arithmetic in a `<<calc: …>>` marker (300 rows), so the numbers
+in the trace and the number in the answer come from `tools.py` rather than from
+sampling.
+
+### 11.4 Document Q&A without a vector database
+
+`rag.py` is ~450 lines of stdlib Python and no dependencies: no embeddings
+package, no vector store, no network call. For a chat UI that answers questions
+about *one* file at a time, that is the right size of tool, and BM25 over word
+unigrams **and bigrams** is a strong lexical baseline for exactly this shape of
+problem:
+
+* **Chunking on structure.** 900 characters with 150 of overlap, cutting on a
+  paragraph break first, then a sentence end, then a space — a chunk that starts
+  mid-sentence costs attention for nothing. Overlap exists so a fact that
+  straddles a boundary is still inside one chunk.
+* **Unigrams + bigrams.** Bigrams ("Cora River", "silver fish") carry most of the
+  meaning in short passages and cost one dictionary lookup; a unigram-only index
+  ranks a chunk that shares "river" as highly as one that shares the phrase.
+* **Relevance as a fraction, not a raw score.** BM25 scores are not comparable
+  across documents — in a two-chunk note every IDF is small, so a fixed
+  `score > 0.5` threshold silently retrieves *nothing* while a 200-chunk book
+  retrieves everything. The score is therefore normalised by the best match the
+  query could achieve in *this* index, and the floor (`MIN_RELEVANCE = 0.30`)
+  means "30% of the achievable match" in both. The number comes from a probe, not
+  from taste: on a one-chunk note a relevant question scores 1.00 while off-topic
+  ones land at 0.18–0.21 ("why does it rain?" against a note about a creature:
+  0.182), so 0.30 separates them with room to spare. On a 232-chunk book the same
+  floor only removes the bottom of the distribution — an off-topic query can still
+  reach 1.00 there, which is why the sources fold and the grounding warning exist
+  and this floor is not sold as a correctness guarantee.
+* **The floor matters more than the ranking.** If nothing clears it, no context
+  is injected at all. Padding a 256-token prompt with an unrelated passage and
+  asking "answer ONLY from this context" is how a RAG demo produces confident
+  nonsense; the page says "no relevant passage" instead.
+* **A trigram fallback for typos.** When BM25 scores nothing at all (every query
+  term unknown), character-trigram cosine similarity is tried — so "the blue
+  wale" still finds the whale passage. It only runs when BM25 found nothing:
+  mixing the two would let a fuzzy match outrank a real keyword hit.
+* **The block is budgeted, and the context goes first.** The injection is the
+  exact template the feature is specified with:
+
+  ```text
+  Context from uploaded document:
+  [1] <passage>
+  [2] <passage>
+
+  Answer the user's question based ONLY on this context.
+  ```
+
+  `context_block()` takes a token budget and a `cost()` callable (the caller owns
+  the tokenizer) and trims the passage to the window around the matched terms —
+  binary search on the text, same idea as `personas.shrink()`. The document block
+  precedes any persona text because the persona is the part that may be dropped:
+  a truncated instruction to obey the document is worth more than a truncated
+  description of a pirate.
+* **Grounding is measured.** `rag.grounding(reply, context)` is the share of the
+  reply's content words that appear in the retrieved context, and the UI warns
+  when a reply shares almost nothing with the document. It is a heuristic — a
+  well-phrased paraphrase can score low — so it is presented as a warning next to
+  the sources, never as a verdict, and short replies are not judged at all.
+
+The part that makes this a *feature* rather than plumbing is the data: 2,027 of the
+6,000 SFT rows carry a real `rag.context_block()` system turn. The entities in
+those passages are invented (`zorble`, `quibble`, the Cora River), the sentences
+name their subject and carry the keyword the question asks with
+(`lives`/`eats`/`makes`), and they are shuffled inside the passage next to a
+second creature's sentences — so the answer is never simply the first line, and
+position or shape alone cannot pick it out. 184 rows ask about a fact the passage
+does not contain and answer `The document does not say.` — the honest answer,
+trained.
+
+Two versions of those rows were lessons in how a 7 M model takes a shortcut.
+The first rephrased the passage, made refusals 35% of the document rows, and
+pinned answers and refusals equally hard; the model answered *"The document does
+not say."* to **every** document question, including three about a passage that
+plainly contained the answer. The second copied the passage's own sentence, but
+paired twelve fixed names with twelve fixed facts — and the model learned the
+table. Asked "Where does the marlow live?" with a passage that said *Low Fen*, it
+replied with the fact it had memorized from training, and for an entity it had
+never seen it said the document does not say. Both failures were caught by
+`--doc-check`, which is the whole argument for having a check instead of a claim.
+
+The fix is in the data: the values are paired with names **at random** across
+rows, so there is no table to memorize and copying is the only way to be right.
+`--doc-pins 64` then repeats the two *longest* answering rows (a short pinned row
+would be memorized outright and would teach that a document answer is a sentence
+fragment) and one refusal at half that weight. `--doc-check 3` checks it with two
+held-out subjects and two series of sentence shapes, one of which no training row
+uses — and each series also asks a question the passage *cannot* answer, because
+"always copy something" and "never copy anything" fail in opposite directions and
+each passes the other's test.
+
+That third version still did not read, and the third diagnosis is the one worth
+keeping: replaying a **training** row's own prefix recovers its recorded answer
+exactly, so the model had memorized the passages the checks could not tell apart
+from reading. A fourth run trained on the document family *alone* — nothing else
+in the corpus, 400 steps, validation loss 0.0015, i.e. a near-perfect fit of the
+training rows — still answered "The document does not say." to a held-out
+passage. So in-context copying did not emerge at this scale, and no amount of
+re-balancing the mixture was going to fix it: 7 M parameters, six layers and a
+256-token window will store 2,000 passages before they will learn to *look one
+up*. The feature still ships, because retrieval, injection, the exact template,
+the sources card and the grounding warning are all exact and tested; what ships
+with a caveat is the last step, and the caveat is printed by `--doc-check`
+rather than left for the user to discover.
+
 ## 12. File map
 
 | file | contents |
@@ -983,10 +1150,13 @@ way to see what the model does without it.
 | `05_evaluate.py` | loss/ppl/accuracy/bpb, unigram + bigram baselines, loss curve |
 | `06_generate.py` | sampling (temp/top-k/top-p/repeat-penalty) + KV cache |
 | `sample.py` | generation CLI (research: every knob, cached-vs-uncached timing) |
-| `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths; `--chat` REPL with system prompts + calculator |
-| `web_ui.py` | browser chat UI (gradio or stdlib): streaming, persona picker, latency monitor, copy buttons |
-| `personas.py` | system-prompt presets, marker sanitising, prompt-size shrinking (§11.1) |
-| `tools.py` | safe AST calculator, arithmetic detection, stream-safe `<<calc: …>>` substitution (§11.2) |
+| `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths; `--chat` REPL with system prompts, tools, `--doc` |
+| `web_ui.py` | browser chat UI (gradio or stdlib): streaming, thinking folds, tool cards, upload, latency monitor |
+| `personas.py` | system-prompt presets, `<think>` parsing + stream filter, marker sanitising, prompt shrinking (§11.1, §11.3) |
+| `rag.py` | in-memory retrieval: chunking, BM25 + trigram fallback, budgeted context block, grounding (§11.4) |
+| `tools.py` | calculator + whitelisted python interpreter, question detection, stream-safe markers (§11.2) |
+| `07_make_sft.py` | the synthetic corpus: chat, CoT traces, document-grounded rows |
+| `08_sft.py` | response-only SFT + CoT/document curricula and post-training checks |
 | `run.ps1` / `run.bat` | one-click Windows launchers for `generate.py` |
 | `run_web.ps1` / `run_web.bat` | one-click Windows launchers for `web_ui.py` |
 | `data/tinystories/` | cleaned TinyStories corpus (20 MB, committed) + `stats.json` provenance |
@@ -1014,3 +1184,8 @@ Worth reading, because they're the same ones you'll meet:
 | `--resume` when `opt.pt` was gone, and `best_val` starting at `inf` | **a trained checkpoint was overwritten by a freshly initialised model** — the first eval always "improved" on `inf` | refuse to write into a dir holding checkpoints without `--resume`; error if `--resume` has no `opt.pt`; separate `--model` for warm starts; save `model_<iter>.pt` every eval, not only "best" |
 | per-batch-mean val loss | trainer and `05` disagreed (190 vs 173) on identical weights; biased the "is this best?" decision | token-weighted average, and clamp eval batch size to divide the val set exactly |
 | tok/s divided by steps since last log, but `t0` reset every log | first line read 850 tok/s, then a flat wrong 34 tok/s for the whole run | derive `steps` from `it - last_log`; never trust a rate that is suspiciously constant |
+| document rows trained the model on *rephrased* answers, with refusals 35% of the family and pinned as hard as the answers | the model answered "The document does not say." to **every** document question, including three about a passage that plainly held the answer | answer with the passage's *own sentence*, refusals down to ~9% of the family (184/2,027), and pin two answering rows at `--doc-pins` but the refusal at half of it |
+| twelve fixed names paired with twelve fixed facts | the trained model answered document questions from *memory*: given a passage saying the marlow lives in Low Fen it replied with the fact it had memorized, and it refused every subject it had not seen | pair names and values **at random** across rows, shuffle the sentences next to a second creature's, and check two held-out subjects — one with the corpus's sentence shapes, one with shapes no training row contains |
+| a training row longer than the 256-token window | `encode_example` front-trims it, silently deleting part of the prompt or of the injected document, so the row teaches the opposite of what it was written for — and no error is raised | the corpus maker counts chat tokens with the real tokenizer and drops any row that does not fit (a char-count proxy is wrong: an 815-char row is 256 tokens, a 636-char one is 257); the SFT suite re-asserts the invariant |
+| `--doc-check`'s reply budget was set to half the passage budget | document questions that opened a `<think>` block were cut off mid-trace, so the check measured its own token cap instead of the model | a named `DOC_CHECK_REPLY_TOKENS = 64` for the reply, separate from the passage budget |
+| a stale `_int8.pt` next to a fresh fp32 checkpoint | both frontends auto-prefer the INT8 file when it exists, so `run.ps1 -Chat` answered with the *previous* fine-tune until it was re-quantized | quantize in the same step as training, and say so in the reproduce steps |

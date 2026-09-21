@@ -21,17 +21,33 @@ tokenizer/chat byte-BPE, <|im_start|>/<|im_end|> turn framing, an optional
 <|im_start|>system turn (personas.py), oldest complete turns dropped when the
 256-token context fills, and generation stops the moment <|im_end|> is sampled.
 
-Three things the browser adds on top of the terminal:
+What the browser adds on top of the terminal:
 
+ * **Reasoning view.** A reply that plans inside `<think> … </think>` (the
+   format `07_make_sft.py` trains) is rendered as a collapsible, DeepSeek-style
+   drop-down above the answer, open while it is still being written and folded
+   away once the answer starts. The split is `personas.split_think`, the same
+   function the terminal uses.
+ * **Document Q&A (RAG).** "📄 Upload Document" reads a .txt/.md file in the
+   browser, POSTs its text, and `rag.py` indexes it in memory (BM25 over word
+   unigrams/bigrams, character-trigram fallback). Each question retrieves the two
+   best passages and injects them into the system prompt as
+   `Context from uploaded document: … Answer the user's question based ONLY on
+   this context.`, trimmed to the token budget that is actually left in the
+   256-token window. Retrieved passages are shown with the reply.
  * **System prompt / persona picker.** Four presets (friendly, pirate, math,
    storyteller), a custom text box, and an explicit "None" that sends no system
    turn at all. The resolved text is re-serialised server-side for every
    request, so switching persona mid-conversation cannot leave a stale block in
    the prompt.
- * **Calculator hook** (tools.py). A bare "5 + 5" is answered by the calculator
-   *before* the model runs, and a `<<calc: …>>` the model emits is substituted
-   with the exact value mid-stream. Both paths are labelled in the UI, so a
-   computed answer is never confused with a sampled one.
+ * **Tool hooks** (tools.py). A bare "5 + 5" is answered by the calculator
+   *before* the model runs, a `<<calc: …>>`/`<<tool: …>>` the model emits is
+   substituted with the exact value mid-stream, and word counts, reversals,
+   case changes and date/time questions are computed too ("how many words is
+   this?", "what is the date today?"). Python tool runs are shown as
+   `🐍 Python Tool Execution` cards with the source and its result; arithmetic
+   keeps the 🧮 calculator label. Every path is labelled, so a computed answer is
+   never confused with a sampled one.
  * **Token counter / latency monitor** in the header: live tokens, tok/s and
    elapsed time while streaming, then time-to-first-token, prompt size and seed
    for the finished turn — the numbers come from the server, not from guesswork.
@@ -78,13 +94,17 @@ if str(HERE) not in sys.path:            # the stage files are importable by nam
     sys.path.insert(0, str(HERE))
 
 import generate as cli                   # noqa: E402  (stdlib-only; for serialize_chat)
-import personas                          # noqa: E402  (system-prompt presets)
-import tools                             # noqa: E402  (safe calculator)
+import personas                          # noqa: E402  (system prompts + <think> protocol)
+import rag                               # noqa: E402  (in-memory document retrieval)
+import tools                             # noqa: E402  (calculator + python tool)
 
 APP_NAME = "TinyStories Chat"
 MAX_MESSAGE_CHARS = 4000                 # prompt-injection-by-paste is a RAM problem, not a model one
 MAX_HISTORY_TURNS = 40                   # complete user/assistant pairs
 MAX_BODY_BYTES = 1 << 16                 # HTTP request cap; a chat message is never 64 KB
+MAX_UPLOAD_BYTES = 2 << 20               # a .txt/.md document is never 2 MB of paste
+MAX_DOC_NAME_CHARS = 80
+RAG_TOP_K = 2                            # retrieved passages per question
 IM_START, IM_END = "<|im_start|>", "<|im_end|>"
 
 
@@ -158,6 +178,12 @@ class ChatEngine:
         # getattr: tests and embedders build `args` by hand and only set what
         # they need, so every new option must have a working default.
         self.tools_on = not getattr(args, "no_tools", False)
+        self.rag_on = not getattr(args, "no_rag", False)
+        #: The uploaded document, if any. One at a time on purpose: a chat UI
+        #: with three documents and no way to see which passages were used is a
+        #: plausible-sounding answer generator, not a document assistant.
+        self.docs: "rag.DocumentIndex | None" = None
+        self.docs_lock = threading.Lock()
         system = getattr(args, "system", None)
         self.default_persona_value = (system if system is not None
                                       else getattr(args, "persona", None)
@@ -173,6 +199,9 @@ class ChatEngine:
             "personas": personas.choices(),
             "system": text,
             "tools": self.tools_on,
+            "rag": self.rag_on,
+            "doc": self.doc_info(),
+            "reasoning": {"open": personas.THINK_OPEN, "close": personas.THINK_CLOSE},
             "checkpoint": str(self.ckpt_path),
             "checkpoint_mb": round(self.ckpt_path.stat().st_size / 1e6, 1),
             "config": str(self.cfg_path),
@@ -194,6 +223,65 @@ class ChatEngine:
                 self._active_cancel.set()
                 return True
         return False
+
+    # --------------------------------------------------------------- documents
+    def doc_info(self) -> dict | None:
+        """Index statistics for the loaded document, or None."""
+        with self.docs_lock:
+            index = self.docs
+            return None if index is None else index.stats()
+
+    def set_document(self, name: str, text: str) -> dict:
+        """Index `text` in memory and replace whatever was there before.
+
+        The index is built outside the chat lock (indexing a book takes a moment
+        and no model call is in flight), then swapped in atomically: a request
+        between the two sees either the old document or the new one, never a
+        half-built index.
+        """
+        clean_name = " ".join(str(name or "").split())[-MAX_DOC_NAME_CHARS:] or "document"
+        body = str(text or "").replace("\x00", "").replace("\r\n", "\n")
+        if not body.strip():
+            raise ValueError("the document is empty")
+        index = rag.DocumentIndex.from_text(body, name=clean_name)
+        with self.docs_lock:
+            self.docs = index
+        return index.stats()
+
+    def clear_document(self) -> bool:
+        with self.docs_lock:
+            had = self.docs is not None
+            self.docs = None
+        return had
+
+    def _tokens(self, prompt_system: str) -> int:
+        """Token count of a system block in this engine's own serialization."""
+        text = self.serialize([], "", prompt_system)
+        return len(self.tok.encode_with_specials(text, [IM_START, IM_END]))
+
+    def rag_context(self, question: str, system_text: str) -> tuple[str, list]:
+        """Inject the retrieved passages into the system prompt.
+
+        Returns `(system, hits)`. The document block goes **first** and the
+        persona text after it: `personas.shrink` keeps the longest fitting
+        prefix, so if the two together overflow the window, what survives is the
+        context and its "answer ONLY from this context" instruction — not a
+        persona paragraph the model does not obey anyway.
+        """
+        with self.docs_lock:
+            index = self.docs
+        if index is None or not self.rag_on:
+            return system_text, []
+        reserve = min(getattr(self.args, "n", 128) or 128, max(32, self.cfg.block_size // 3))
+        budget = self.cfg.block_size - reserve
+        block, hits = index.context_block(question, budget, self._tokens, top_k=RAG_TOP_K)
+        if not block:
+            return system_text, hits
+        if system_text:
+            room = budget - self._tokens(block)
+            extra = personas.shrink(system_text, self._tokens, room) if room > 0 else ""
+            block = f"{block}\n\n{extra}" if extra else block
+        return block, hits
 
     # ------------------------------------------------------------- serialize
     def serialize(self, turns: list[tuple[str, str]], user: str, system: str | None = None) -> str:
@@ -272,15 +360,22 @@ class ChatEngine:
     def stream_chat(self, message: str, history, temperature: float, top_p: float,
                     max_tokens: int | None = None, system: str | None = None,
                     persona: str | None = None):
-        """Yield ("token", text) / ("tool", info) / ("done", meta) / ("error", msg).
+        """Yield ("token", text) / ("tool", info) / ("docs", info) / ("done", meta) / ("error", msg).
 
         Generation runs on a worker thread (the caller's thread is busy
         writing events to a socket or generator), so the on_token callback
         only decodes and enqueues. Cancelling sets an event that the callback
         turns into _Aborted, unwinding generate() between two tokens.
 
-        A bare arithmetic question ("5 + 5") never reaches the model at all:
-        the reply is exact, so there is nothing for the sampler to contribute.
+        Questions the tools can answer exactly never reach the model at all: a
+        bare "5 + 5" ("5 + 5 = 10"), "how many words is this?" and "what is the
+        date today?" are computed, because the sampler has nothing to add to a
+        fact. A question *inside* prose still goes to the model — it may be part
+        of a bigger question — and the exact value is appended to the reply.
+
+        When a document is loaded, the two best passages are injected into the
+        system prompt and reported in a `docs` event, so the browser can show
+        what the answer was allowed to see.
         """
         a = self.args
         try:
@@ -305,24 +400,46 @@ class ChatEngine:
             yield ("error", str(e))
             return
 
-        # ---- calculator hook: answer explicit arithmetic without the model ----
-        query = tools.find_math_question(user) if self.tools_on else None
+        # ---- retrieval: the document goes in the system block, sized to fit ----
+        hits: list = []
+        doc = self.doc_info()
+        if doc is not None and self.rag_on:
+            system_text, hits = self.rag_context(user, system_text)
+            if hits:
+                # re-run the budget check with the augmented system prompt: the
+                # context is only useful if the *question* still fits next to it
+                try:
+                    user, turns, prompt_ids, dropped, system_text = self.build_prompt(
+                        user, turns, max_new, system_text)
+                except ValueError as e:                      # pragma: no cover
+                    yield ("error", str(e))
+                    return
+                yield ("docs", {"doc": doc, "hits": [h.to_json() for h in hits],
+                                "system_chars": len(system_text)})
+
+        # ---- tool hook: anything a tool can answer exactly, without the model ----
+        query = tools.find_tool_question(user) if self.tools_on else None
         if query is not None and query.bare:
             started = time.perf_counter()
-            yield ("tool", {"expression": query.expression, "result": query.text,
-                            "line": query.answer, "source": "question"})
+            event = query.to_event()
+            yield ("tool", event)
             yield ("token", query.answer)
-            yield ("done", {"reply": query.answer, "source": "calculator",
-                            "n_tokens": 0, "tok_per_s": None,
-                            "elapsed_s": round(time.perf_counter() - started, 4),
-                            "first_token_s": round(time.perf_counter() - started, 4),
-                            "seed": None, "temperature": temperature, "top_p": top_p,
-                            "stop_reason": "tool", "turns_dropped": dropped,
-                            "history_turns": len(turns), "prompt_tokens": len(prompt_ids),
-                            "system": system_text, "persona": system_label,
-                            "tool": {"expression": query.expression, "result": query.text,
-                                     "line": query.answer, "source": "question"},
-                            "tool_calls": []})
+            done = {"reply": query.answer,
+                    "source": "calculator" if query.kind == "math" else query.source,
+                    "n_tokens": 0, "tok_per_s": None,
+                    "elapsed_s": round(time.perf_counter() - started, 4),
+                    "first_token_s": round(time.perf_counter() - started, 4),
+                    "seed": None, "temperature": temperature, "top_p": top_p,
+                    "stop_reason": "tool", "turns_dropped": dropped,
+                    "history_turns": len(turns), "prompt_tokens": len(prompt_ids),
+                    "system": system_text, "persona": system_label,
+                    "tool_calls": [], "think": {"reasoning": "", "answer": query.answer,
+                                                "closed": True, "has_reasoning": False},
+                    "doc": doc, "retrieved": [h.to_json() for h in hits]}
+            if query.kind == "math":
+                done["tool"] = {"expression": query.expression, "result": query.text,
+                                "line": query.answer, "source": "question"}
+            yield ("done", done)
             return
 
         cancel = threading.Event()
@@ -375,8 +492,8 @@ class ChatEngine:
                     # A math question the model answered *without* the right
                     # number is the failure this hook exists to prevent: append
                     # the exact value instead of letting a guess stand alone.
-                    if query is not None and not tools.value_in_text(
-                            query.calculation, "".join(streamed)):
+                    if query is not None and query.kind == "math" and not tools.value_in_text(
+                            query.result, "".join(streamed)):
                         extra = f"\n\n🧮 {query.answer}"
                         streamed.append(extra)
                         events.put(("token", extra))
@@ -388,6 +505,11 @@ class ChatEngine:
                           else "length" if len(new) >= max_new else "context")
                 reply = "".join(streamed).strip()
                 calls = [c.line for c in tool_filter.calls] if tool_filter is not None else []
+                thought = personas.split_think(reply)
+                # Which evaluator produced the call, not what type it returned:
+                # `word_count('a b')` is a value of 2 and still a python tool run.
+                python_calls = [c for c in (tool_filter.calls if tool_filter is not None else [])
+                                if c.source != "calc"]
                 meta = {
                     "reply": reply,
                     "source": "model",
@@ -406,12 +528,21 @@ class ChatEngine:
                     "system": system_text,
                     "persona": system_label,
                     "tool_calls": calls,
+                    "think": thought.to_json(),
+                    "doc": doc,
+                    "retrieved": [h.to_json() for h in hits],
+                    "grounding": (rag.grounding(reply, system_text)
+                                  if hits and reply else None),
                 }
-                if query is not None:
+                if query is not None and query.kind == "math":
                     meta["tool"] = {"expression": query.expression, "result": query.text,
                                     "line": query.answer, "source": "question"}
                 if calls:
                     events.put(("tool", {"source": "model", "calls": calls}))
+                if python_calls:
+                    events.put(("tool", {"source": "model", "kind": "python",
+                                         "calls": [c.line for c in python_calls],
+                                         "results": [c.to_json() for c in python_calls]}))
                 events.put(("done", meta))
             except _Aborted:
                 tail = decoder.finish()
@@ -429,6 +560,9 @@ class ChatEngine:
                                      "stop_reason": "stopped", "turns_dropped": dropped,
                                      "history_turns": len(turns), "system": system_text,
                                      "persona": system_label,
+                                     "think": personas.split_think("".join(streamed)).to_json(),
+                                     "doc": doc, "retrieved": [h.to_json() for h in hits],
+                                     "grounding": None,
                                      "tool_calls": ([c.line for c in tool_filter.calls]
                                                     if tool_filter is not None else [])}))
             except Exception as e:           # a model error is one bad turn, not a dead server
@@ -549,6 +683,61 @@ button.mini {
 }
 button.mini:hover { color: var(--text); background: var(--panel-2); border-color: #31405e; }
 button.mini.ok { color: var(--ok); border-color: rgba(65,209,157,.5); }
+/* ---- reasoning block: a DeepSeek-style fold above the answer ---- */
+.think {
+  border: 1px solid #2c3550; border-left: 3px solid #7c6dff; border-radius: 10px;
+  background: linear-gradient(180deg, rgba(124,109,255,.10), rgba(124,109,255,.03));
+  margin: 0 0 10px; overflow: hidden;
+}
+.think summary {
+  cursor: pointer; user-select: none; list-style: none; padding: 7px 12px;
+  font-size: 12.5px; color: #b9b2ff; display: flex; align-items: center; gap: 8px;
+}
+.think summary::-webkit-details-marker { display: none; }
+.think summary::after { content: "▾"; margin-left: auto; color: var(--faint); font-size: 11px; }
+.think[open] summary::after { content: "▴"; }
+.think summary .spin {
+  width: 8px; height: 8px; border-radius: 50%; background: #7c6dff;
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.think[data-live="0"] summary .spin { display: none; }
+@keyframes pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+.think-body {
+  padding: 2px 14px 12px; font-size: 13px; line-height: 1.6; color: #b6bed4;
+  white-space: pre-wrap; word-wrap: break-word; border-top: 1px solid rgba(124,109,255,.18);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.think.note { border-left-color: var(--danger); background: rgba(255,107,107,.06); }
+.think.note summary { color: #ffb4b4; }
+
+/* ---- tool cards: 🐍 Python Tool Execution ---- */
+.toolcard {
+  margin: 0 0 10px; border: 1px solid #2b3a35; border-left: 3px solid var(--ok);
+  border-radius: 10px; background: rgba(65,209,157,.07); overflow: hidden;
+}
+.toolcard .head {
+  padding: 6px 12px; font-size: 12.5px; color: #9fe8c9; border-bottom: 1px solid rgba(65,209,157,.16);
+}
+.toolcard pre {
+  margin: 0; padding: 9px 12px; font-size: 12.5px; line-height: 1.5; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.toolcard pre.out { color: #cfe9df; border-top: 1px dashed rgba(65,209,157,.18); }
+.toolcard pre.code { color: #dbe6ff; }
+.toolcard .outlabel { color: var(--muted); }
+
+/* ---- retrieval sources ---- */
+.sources { margin: 8px 0 0; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-soft); }
+.sources summary { cursor: pointer; padding: 7px 12px; font-size: 12.5px; color: var(--muted); list-style: none; }
+.sources summary::-webkit-details-marker { display: none; }
+.sources .hit { padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--muted); }
+.sources .hit b { color: var(--text); font-weight: 600; }
+.sources .hit .score { color: var(--ok); font-variant-numeric: tabular-nums; }
+.docrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pill.doc { color: #9fe8c9; border-color: rgba(65,209,157,.35); }
+#docNote { font-size: 11.5px; color: var(--faint); }
+#docNote.error { color: #ffb4b4; }
+button.mini.upload { border-style: dashed; }
 .caret { display: inline-block; width: 8px; height: 16px; vertical-align: text-bottom;
   background: var(--accent); border-radius: 2px; margin-left: 2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -613,6 +802,18 @@ footer {
     <textarea id="systemPrompt" rows="1" spellcheck="false"
       placeholder="You are a helpful assistant…"></textarea>
   </div>
+  <div class="ctl doc" id="docCtl">
+    <label for="uploadBtn">Document (Local Q&amp;A)</label>
+    <div class="docrow">
+      <button type="button" id="uploadBtn" class="mini upload">📄 Upload Document (.txt / .md)</button>
+      <input type="file" id="fileInput" accept=".txt,.md,.markdown,text/plain,text/markdown" hidden>
+      <span class="chip pill doc" id="docChip" style="display:none">
+        📄 <b id="docName"></b>&nbsp;<span id="docStats"></span>
+        <button type="button" id="docClear" class="mini" title="Remove the document">✕</button>
+      </span>
+      <span id="docNote"></span>
+    </div>
+  </div>
   <div class="slider">
     <label for="temp">Temperature</label>
     <input type="range" id="temp" min="0.1" max="1.5" step="0.05" value="__TEMP__">
@@ -629,15 +830,18 @@ footer {
   <div id="welcome">
     <h2>Say hello to your from-scratch LLM 👋</h2>
     <p>A ~15 M-parameter transformer (Llama-style), tokenizer and chat fine-tune all
-    built and trained locally. INT8 quantized from scratch for ~4x smaller weights.
-    It runs entirely on this machine — nothing leaves your network. Pick a system
-    prompt above to change its tone; arithmetic goes to a real calculator, not to
+    built and trained locally with chain-of-thought traces, INT8 quantized from
+    scratch for ~4x smaller weights. It runs entirely on this machine — nothing
+    leaves your network. Ask a question that needs a few steps and it plans inside
+    a <code>&lt;think&gt;</code> block first; upload a .txt/.md file and it answers
+    from your document; arithmetic, word counts and dates go to real Python, not to
     the model's guesswork.</p>
     <div class="examples">
       <button class="example">Hello! Who are you?</button>
-      <button class="example">Tell me a short story about a cat.</button>
+      <button class="example">Why does it rain?</button>
+      <button class="example">Sam has 12 marbles, gets 4 more, and gives 6 away. How many marbles does Sam have?</button>
+      <button class="example">What is the date today?</button>
       <button class="example">What is 12 * 4?</button>
-      <button class="example">Why is the sky blue?</button>
     </div>
   </div>
 </div></div>
@@ -668,7 +872,11 @@ const totalsEl = document.getElementById('totals');
 // terminal REPL and the browser); the hint text is added server-side.
 const PERSONAS = __PERSONAS_JSON__;
 const DEFAULTS = { persona: "__DEFAULT_PERSONA__", system: __DEFAULT_SYSTEM_JSON__,
-                   tools: __TOOLS__ };
+                   tools: __TOOLS__, rag: __RAG__, doc: __DOC_JSON__,
+                   maxUploadMB: __MAX_UPLOAD_MB__,
+                   thinkOpen: "__THINK_OPEN__", thinkClose: "__THINK_CLOSE__" };
+
+let document_ = DEFAULTS.doc || null;      // {name, chars, chunks, terms, ...} or null
 
 let history = [];          // [{user, assistant}, ...] complete turns only — like the terminal REPL
 let busy = false;
@@ -790,6 +998,114 @@ function setBusy(b) {
   sendBtn.classList.toggle('primary', !b);
 }
 
+// The reasoning split, mirroring personas.split_think: the first <think> block is
+// the trace, everything after its closing marker is the answer. Only the *first*
+// block counts, and a missing </think> is reported as closed=false rather than
+// guessed at — a half-written trace is a stream in progress, not an answer.
+function stripThink(text) {
+  // mirror of personas.strip_think: remove every block, and an unterminated one
+  let out = String(text || '');
+  while (out.indexOf(DEFAULTS.thinkOpen) >= 0) {
+    const start = out.indexOf(DEFAULTS.thinkOpen);
+    const end = out.indexOf(DEFAULTS.thinkClose, start + DEFAULTS.thinkOpen.length);
+    if (end < 0) { out = out.slice(0, start); break; }
+    out = out.slice(0, start) + out.slice(end + DEFAULTS.thinkClose.length);
+  }
+  return out.split(DEFAULTS.thinkClose).join('');
+}
+
+function splitThink(text) {
+  // mirror of personas.split_think — the parity of the two is a unit test
+  const raw = String(text || '');
+  const open = raw.indexOf(DEFAULTS.thinkOpen);
+  if (open < 0) return { reasoning: '', answer: raw.trim(), closed: true, hasReasoning: false };
+  const prefix = raw.slice(0, open).trim();      // "Let me work this out." is kept
+  const close = raw.indexOf(DEFAULTS.thinkClose, open + DEFAULTS.thinkOpen.length);
+  const reasoning = (close < 0 ? raw.slice(open + DEFAULTS.thinkOpen.length)
+                               : raw.slice(open + DEFAULTS.thinkOpen.length, close)).trim();
+  const hasReasoning = reasoning.length > 0;
+  if (close < 0) {
+    return { reasoning: reasoning, answer: prefix, closed: false, hasReasoning: hasReasoning };
+  }
+  const answer = stripThink(raw.slice(close + DEFAULTS.thinkClose.length)).trim();
+  return { reasoning: reasoning, closed: true, hasReasoning: hasReasoning,
+           answer: (prefix ? prefix + ' ' + answer : answer).trim() };
+}
+
+function thinkingCard(thought) {
+  const card = document.createElement('details');
+  card.className = 'think';
+  card.open = !thought.answer && !thought.closed;   // open while it is still thinking
+  const summary = document.createElement('summary');
+  const spin = document.createElement('span');
+  spin.className = 'spin';
+  const label = document.createElement('span');
+  label.textContent = thought.closed
+    ? '🧠 Reasoning · ' + thought.reasoning.length + ' chars'
+    : '🧠 Thinking… · ' + thought.reasoning.length + ' chars';
+  summary.appendChild(spin);
+  summary.appendChild(label);
+  const body = document.createElement('div');
+  body.className = 'think-body';
+  body.textContent = thought.reasoning || '…';
+  card.appendChild(summary);
+  card.appendChild(body);
+  return card;
+}
+
+function toolCard(info) {
+  const card = document.createElement('div');
+  card.className = 'toolcard';
+  const head = document.createElement('div');
+  head.className = 'head';
+  head.textContent = '🐍 Python Tool Execution'
+    + (info.kind ? ' · ' + info.kind : '')
+    + (info.source === 'model' ? ' (model-requested)' : ' (answered locally, no model tokens)');
+  card.appendChild(head);
+  const items = info.results || [info];
+  for (const item of items) {
+    const code = document.createElement('pre');
+    code.className = 'code';
+    code.textContent = item.code || item.expression || '';
+    const out = document.createElement('pre');
+    out.className = 'out';
+    const tag = document.createElement('span');
+    tag.className = 'outlabel';
+    tag.textContent = '→ ';
+    out.appendChild(tag);
+    out.appendChild(document.createTextNode(item.result != null ? String(item.result)
+                                                                : String(item.line || '')));
+    card.appendChild(code);
+    card.appendChild(out);
+  }
+  return card;
+}
+
+function sourcesCard(info) {
+  const box = document.createElement('details');
+  box.className = 'sources';
+  const summary = document.createElement('summary');
+  const hits = info.hits || [];
+  summary.textContent = '📄 ' + ((info.doc && info.doc.name) || 'document')
+    + ' · ' + hits.length + ' passage' + (hits.length === 1 ? '' : 's') + ' retrieved'
+    + (info.grounding != null ? ' · ' + Math.round(info.grounding * 100) + '% of the reply from the document' : '');
+  box.appendChild(summary);
+  for (const hit of hits) {
+    const row = document.createElement('div');
+    row.className = 'hit';
+    const tag = document.createElement('b');
+    tag.textContent = '[' + hit.index + '] ';
+    const score = document.createElement('span');
+    score.className = 'score';
+    score.textContent = ' · relevance ' + Number(hit.relevance).toFixed(2) + ' · ';
+    row.appendChild(tag);
+    row.appendChild(score);
+    row.appendChild(document.createTextNode(hit.excerpt || ''));
+    box.appendChild(row);
+  }
+  return box;
+}
+
 function addMsg(role, text) {
   const msg = document.createElement('div');
   msg.className = 'msg ' + role;
@@ -806,7 +1122,9 @@ function addMsg(role, text) {
   actions.className = 'actions';
   const meta = document.createElement('div');
   meta.className = 'meta';
-  const entry = { bubble, meta, actions, text: text || '', codeBtn: null };
+  const entry = { bubble, meta, actions, text: text || '', codeBtn: null,
+                  answerBtn: null, cards: null, footer: null, docsInfo: null,
+                  reasoning: '', answer: '' };
   actions.appendChild(miniButton(role === 'user' ? 'Copy' : 'Copy response',
                                 () => copyText(entry.text, actions.firstChild)));
   if (role === 'assistant') {
@@ -814,6 +1132,11 @@ function addMsg(role, text) {
     codeBtn.style.display = 'none';        // only once the reply contains code
     entry.codeBtn = codeBtn;
     actions.appendChild(codeBtn);
+    // "just the answer" only makes sense once there is a reasoning block to skip
+    const answerBtn = miniButton('Copy answer', () => copyText(entry.answer || entry.text, answerBtn));
+    answerBtn.style.display = 'none';
+    entry.answerBtn = answerBtn;
+    actions.appendChild(answerBtn);
   }
   box.appendChild(bubble);
   box.appendChild(actions);
@@ -861,9 +1184,21 @@ async function send(text) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    const paint = () => {
+    const paint = (streaming) => {
       caret.remove();
-      bubble.textContent = entry.text;   // safe: model text becomes a text node, never HTML
+      // Everything below is built with textContent: model output and document
+      // text become text nodes, never HTML — a document that contains <script>
+      // is a document, not an injection.
+      const thought = splitThink(entry.text);
+      entry.reasoning = thought.reasoning;
+      entry.answer = thought.answer;
+      bubble.textContent = '';
+      if (entry.cards) bubble.appendChild(entry.cards);
+      if (thought.hasReasoning) bubble.appendChild(thinkingCard(thought));
+      const body = thought.answer || (thought.closed && !thought.hasReasoning ? entry.text : '');
+      if (body) bubble.appendChild(document.createTextNode(body));
+      if (entry.footer) bubble.appendChild(entry.footer);
+      if (entry.answerBtn) entry.answerBtn.style.display = thought.hasReasoning ? '' : 'none';
       bubble.appendChild(caret);
       scrollBottom();
     };
@@ -884,20 +1219,43 @@ async function send(text) {
           setPerf(live + ' tok · ' + (live / Math.max(el, 0.001)).toFixed(1) + ' tok/s · ' +
                   el.toFixed(1) + 's');
           if (ev.text.indexOf('```') >= 0 && entry.codeBtn) entry.codeBtn.style.display = '';
-          paint();
+          paint(true);
+        } else if (ev.type === 'docs') {
+          // retrieval happened: remember it, show the sources with the answer
+          entry.docsInfo = ev;
         } else if (ev.type === 'tool') {
-          const info = ev.source === 'question'
-            ? '🧮 ' + ev.line + ' — computed locally, no model tokens'
-            : '🧮 calculator: ' + (ev.calls || []).join(', ');
-          meta.dataset.tool = info;
+          if (ev.kind && ev.kind !== 'math') {
+            // python / date-time tool: a card with the source and its result
+            entry.cards = entry.cards || document.createElement('div');
+            entry.cards.appendChild(toolCard(ev));
+            meta.dataset.tool = '🐍 ' + (ev.answer || ev.line || 'python tool');
+          } else {
+            const info = (ev.source === 'question' || ev.source === 'datetime')
+              ? '🧮 ' + (ev.line || ev.answer) + ' — computed locally, no model tokens'
+              : '🧮 calculator: ' + (ev.calls || []).join(', ');
+            meta.dataset.tool = info;
+          }
         } else if (ev.type === 'done') {
           entry.text = ev.reply || entry.text;
-          bubble.textContent = entry.text || '(no reply — try a higher temperature)';
+          entry.docsInfo = ev.retrieved && ev.retrieved.length
+            ? { doc: ev.doc, hits: ev.retrieved, grounding: ev.grounding }
+            : entry.docsInfo;
+          if (entry.docsInfo && entry.docsInfo.hits && entry.docsInfo.hits.length) {
+            entry.footer = entry.footer || document.createElement('div');
+            entry.footer.textContent = '';
+            entry.footer.appendChild(sourcesCard(entry.docsInfo));
+          }
+          paint(false);
+          if (!entry.answer && !entry.reasoning) {
+            bubble.textContent = entry.text || '(no reply — try a higher temperature)';
+            caret.remove();
+            bubble.appendChild(caret);
+          }
           history.push({ user: text, assistant: entry.text });
           if (entry.codeBtn && extractCode(entry.text)) entry.codeBtn.style.display = '';
           // ---- latency monitor: server numbers, not client-side guesswork ----
           const parts = [];
-          if (ev.source === 'calculator') {
+          if (ev.source === 'calculator' || ev.source === 'python' || ev.source === 'datetime') {
             parts.push('0 model tokens · computed locally');
           } else {
             parts.push(ev.n_tokens + ' tokens');
@@ -910,6 +1268,23 @@ async function send(text) {
           if (ev.stop_reason === 'stopped') parts.push('stopped');
           else if (ev.stop_reason === 'context') parts.push('context limit');
           if (ev.turns_dropped > 0) parts.push('dropped ' + ev.turns_dropped + ' old turn(s)');
+          const thought = splitThink(entry.text);
+          if (thought.hasReasoning) {
+            parts.push('🧠 reasoned ' + thought.reasoning.length + ' chars'
+                       + (thought.closed ? '' : ' (unclosed)'));
+          }
+          if (entry.docsInfo && entry.docsInfo.hits) {
+            parts.push('📄 ' + entry.docsInfo.hits.length + ' passage(s) from '
+                       + ((entry.docsInfo.doc && entry.docsInfo.doc.name) || 'the document'));
+          } else if (document_) {
+            // A document is loaded but this question cleared no relevance floor,
+            // so nothing was injected: say that here rather than leave the reader
+            // to wonder why the answer ignored a file that is sitting right there.
+            parts.push('📄 nothing relevant in ' + document_.name + ' — no context injected');
+          }
+          if (ev.grounding != null && ev.retrieved && ev.retrieved.length && ev.grounding < 0.34) {
+            parts.push('⚠ the reply shares little wording with the document — check the sources');
+          }
           if (meta.dataset.tool) parts.unshift(meta.dataset.tool);
           meta.textContent = parts.join(' · ');
           setPerf((ev.n_tokens || 0) + ' tok · ' + (ev.tok_per_s ? ev.tok_per_s + ' tok/s' : 'tool') +
@@ -965,6 +1340,71 @@ document.querySelectorAll('.example').forEach(btn => {
   btn.addEventListener('click', () => { inputEl.value = btn.textContent; send(); });
 });
 
+// ------------------------------------------------- document upload (RAG)
+// The browser reads the file and POSTs its text as JSON: no multipart parser in
+// the stdlib, no file ever written to disk, and the server indexes it in memory.
+const uploadBtn = document.getElementById('uploadBtn');
+const fileInput = document.getElementById('fileInput');
+const docChip = document.getElementById('docChip');
+const docName = document.getElementById('docName');
+const docStats = document.getElementById('docStats');
+const docNote = document.getElementById('docNote');
+
+function setDoc(info, note, isError) {
+  document_ = info || null;
+  if (document_) {
+    docName.textContent = document_.name;
+    docStats.textContent = document_.chunks + ' chunks · ' + document_.chars.toLocaleString() + ' chars';
+    docChip.style.display = '';
+  } else {
+    docChip.style.display = 'none';
+  }
+  docNote.textContent = note || '';
+  docNote.classList.toggle('error', !!isError);
+}
+
+async function uploadFile(file) {
+  if (!file) return;
+  if (file.size > DEFAULTS.maxUploadMB * 1024 * 1024) {
+    setDoc(document_, '⚠ ' + file.name + ' is larger than ' + DEFAULTS.maxUploadMB
+                      + ' MB — split it or use the .txt/.md text', true);
+    return;
+  }
+  setDoc(document_, '📄 indexing ' + file.name + '…', false);
+  uploadBtn.disabled = true;
+  try {
+    const text = await file.text();
+    const res = await fetch('/api/upload', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: file.name, text: text }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    setDoc(data, '✓ answers now come from ' + data.name + ' only', false);
+  } catch (err) {
+    setDoc(null, '⚠ ' + (err.message || 'upload failed'), true);
+  } finally {
+    uploadBtn.disabled = false;
+    fileInput.value = '';
+  }
+}
+
+uploadBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => uploadFile(fileInput.files && fileInput.files[0]));
+document.getElementById('docClear').addEventListener('click', async () => {
+  try {
+    await fetch('/api/docs/clear', { method: 'POST' });
+    setDoc(null, 'document removed', false);
+  } catch (err) {
+    setDoc(document_, '⚠ could not clear the document', true);
+  }
+});
+if (!DEFAULTS.rag) {
+  document.getElementById('docCtl').style.display = 'none';
+} else if (document_) {
+  setDoc(document_, 'preloaded with --doc', false);
+}
+
 // Build the persona dropdown, then let /api/info (the server's own idea of the
 // default persona) override the value baked into the page.
 PERSONAS.forEach(p => personaEl.appendChild(new Option(p.label, p.slug)));
@@ -980,6 +1420,7 @@ updateTotals();
     document.getElementById('subtitle').textContent =
       (info.params / 1e6).toFixed(2) + 'M params · ' + info.n_layer + ' layers · ctx ' +
       info.context + ' · vocab ' + info.vocab + ' · torch ' + info.torch;
+    if (info.doc) setDoc(info.doc, '', false);
     if (info.defaults) {
       tempEl.value = info.defaults.temperature; tempEl.dispatchEvent(new Event('input'));
       toppEl.value = info.defaults.top_p; toppEl.dispatchEvent(new Event('input'));
@@ -1007,8 +1448,10 @@ updateTotals();
 
 # ------------------------------------------------------------- stdlib server
 class Handler(BaseHTTPRequestHandler):
-    """One process, one model: GETs serve the page, POST /api/chat streams
-    NDJSON token events, POST /api/stop cancels the in-flight generation."""
+    """One process, one model: GETs serve the page, POST /api/chat streams NDJSON
+    token events, POST /api/stop cancels the in-flight generation, POST
+    /api/upload indexes a document the browser read (no multipart parsing: the
+    page sends the file's text as JSON, which the stdlib can already read)."""
     server_version = "LLMScratchWeb/1.0"
     protocol_version = "HTTP/1.1"
     engine: ChatEngine | None = None
@@ -1029,12 +1472,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, obj: dict, status: int = 200) -> None:
         self._send_bytes(json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8", status)
 
-    def _read_body(self) -> bytes:
+    def _read_body(self, limit: int = MAX_BODY_BYTES) -> bytes:
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             n = 0
-        if n > MAX_BODY_BYTES:
+        if n > limit:
             raise ValueError("request body too large")
         return self.rfile.read(n) if n > 0 else b"{}"
 
@@ -1057,12 +1500,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         elif self.path == "/api/info":
             self._send_json(self.engine.info())
+        elif self.path == "/api/docs":
+            self._send_json({"doc": self.engine.doc_info(), "rag": self.engine.rag_on})
         else:
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:             # noqa: N802
         if self.path == "/api/stop":
             self._send_json({"stopped": self.engine.stop_active()})
+            return
+        if self.path == "/api/docs/clear":
+            self._send_json({"cleared": self.engine.clear_document()})
+            return
+        if self.path == "/api/upload":
+            self._upload()
             return
         if self.path != "/api/chat":
             self._send_json({"error": "not found"}, 404)
@@ -1108,6 +1559,41 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+    # -- document upload
+    def _upload(self) -> None:
+        """Index a document the browser read and POSTed as JSON.
+
+        `multipart/form-data` is not parsed here on purpose: the stdlib has no
+        multipart reader, the page can read the file with `file.text()`, and a
+        request body of `{"name": …, "text": …}` is exactly as safe — the text
+        never touches the filesystem. The size check is on the *text*, so a 3 MB
+        file is refused with a sentence instead of a MemoryError.
+        """
+        if not self.engine.rag_on:
+            self._send_json({"error": "document Q&A is disabled (--no-rag)"}, 403)
+            return
+        try:
+            payload = json.loads(self._read_body(MAX_UPLOAD_BYTES * 3)
+                                 .decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object expected")
+            text = payload.get("text")
+            if not isinstance(text, str):
+                raise ValueError("'text' must be a string")
+            if not text.strip():
+                raise ValueError("the document is empty")
+            if len(text) > MAX_UPLOAD_BYTES:
+                raise ValueError(f"document is larger than {MAX_UPLOAD_BYTES // (1 << 20)} MB")
+            stats = self.engine.set_document(str(payload.get("name") or "document"), text)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+        except rag.RagError as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+        self._send_json({"ok": True, **stats})
+
+
 def render_index(args, engine: ChatEngine | None = None) -> str:
     """Fill the page's placeholders from the CLI defaults.
 
@@ -1129,6 +1615,9 @@ def render_index(args, engine: ChatEngine | None = None) -> str:
     _, system_text = personas.resolve(value)
     tools_on = (getattr(engine, "tools_on", None) if engine is not None
                 else not getattr(args, "no_tools", False))
+    rag_on = (getattr(engine, "rag_on", None) if engine is not None
+              else not getattr(args, "no_rag", False))
+    document = engine.doc_info() if engine is not None else None
     personas_json = json.dumps(personas.choices(), ensure_ascii=False).replace("<", "\\u003c")
     return (INDEX_HTML
             .replace("__APP_NAME__", APP_NAME)
@@ -1138,6 +1627,12 @@ def render_index(args, engine: ChatEngine | None = None) -> str:
             .replace("__DEFAULT_PERSONA__", slug)
             .replace("__DEFAULT_SYSTEM_JSON__", json.dumps(system_text, ensure_ascii=False)
                      .replace("<", "\\u003c"))
+            .replace("__DOC_JSON__", json.dumps(document, ensure_ascii=False)
+                     .replace("<", "\\u003c"))
+            .replace("__THINK_OPEN__", personas.THINK_OPEN)
+            .replace("__THINK_CLOSE__", personas.THINK_CLOSE)
+            .replace("__RAG__", "true" if rag_on else "false")
+            .replace("__MAX_UPLOAD_MB__", f"{MAX_UPLOAD_BYTES // (1 << 20)}")
             .replace("__TOOLS__", "true" if tools_on else "false"))
 
 
@@ -1156,6 +1651,10 @@ def run_stdlib(engine: ChatEngine, args) -> None:
                 print(f"[web]    network: http://{lan}:{args.port}   (other devices on your LAN)")
         except OSError:
             pass
+    doc = engine.doc_info()
+    print(f"[web] document Q&A: {'on' if engine.rag_on else 'off'} "
+          f"({rag.CHUNK_CHARS}-char chunks, in-memory BM25; --no-rag disables)"
+          + (f"  loaded: {doc['name']} ({doc['chunks']} chunks)" if doc else ""))
     print("[web]    Ctrl+C to stop\n", flush=True)
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(local)).start()
@@ -1265,6 +1764,10 @@ def run_gradio(engine: ChatEngine, args) -> None:
     local = f"http://127.0.0.1:{args.port}"
     print(f"\n[web] {APP_NAME} is running (gradio {gr.__version__} backend)")
     print(f"[web]    local:   {local}   network: http://0.0.0.0:{args.port}")
+    doc = engine.doc_info()
+    print(f"[web] document Q&A: {'on' if engine.rag_on else 'off'} "
+          f"({rag.CHUNK_CHARS}-char chunks, in-memory BM25; --no-rag disables)"
+          + (f"  loaded: {doc['name']} ({doc['chunks']} chunks)" if doc else ""))
     print("[web]    Ctrl+C to stop\n", flush=True)
     app.queue().launch(server_name=args.host, server_port=args.port,
                        inbrowser=not args.no_browser, show_error=True)
@@ -1300,8 +1803,13 @@ def main() -> None:
                     help="free-text system prompt the page starts on, overriding --persona "
                          "('' for none); the dropdown can still change it per message")
     ap.add_argument("--no-tools", dest="no_tools", action="store_true",
-                    help="disable the calculator hook (arithmetic goes back to the model, "
-                         "and <<calc: …>> markers are shown as written)")
+                    help="disable the tool hooks (arithmetic goes back to the model, "
+                         "and <<calc: …>> / <<tool: …>> markers are shown as written)")
+    ap.add_argument("--doc", default=None, metavar="FILE",
+                    help="preload a .txt/.md document for document Q&A (upload or clear "
+                         "it from the page); --no-rag disables retrieval entirely")
+    ap.add_argument("--no-rag", dest="no_rag", action="store_true",
+                    help="disable document upload and retrieval")
     ap.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     ap.add_argument("--backend", choices=("auto", "gradio", "stdlib"), default="auto",
                     help="auto: gradio when importable, always with stdlib fallback")
@@ -1406,8 +1914,19 @@ def main() -> None:
     n_system = len(tok.encode_with_specials(system_text, [IM_START, IM_END])) if system_text else 0
     print(f"[web] system prompt: {system_label}"
           + (f"  ({n_system} tokens)" if n_system else "  (none)"))
-    print(f"[web] calculator hook: {'on' if engine.tools_on else 'off'} "
-          f"(tools.py; --no-tools disables)", flush=True)
+    print(f"[web] tool hooks: {'on' if engine.tools_on else 'off'} "
+          f"(tools.py: calculator, python tool, date/time; --no-tools disables)", flush=True)
+    if args.doc:
+        doc_path = resolve(Path(args.doc))
+        if not doc_path.exists():
+            die(f"--doc {doc_path} does not exist.")
+        try:
+            stats = engine.set_document(doc_path.name, doc_path.read_text(encoding="utf-8",
+                                                                         errors="replace"))
+            print(f"[web] document '{stats['name']}': {stats['chunks']} chunks, "
+                  f"{stats['chars']:,} chars, {stats['terms']:,} terms", flush=True)
+        except (OSError, ValueError, rag.RagError) as e:
+            die(f"--doc {doc_path}: {e}")
 
     use_gradio = args.backend in ("auto", "gradio")
     if use_gradio:

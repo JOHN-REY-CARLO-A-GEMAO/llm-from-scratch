@@ -10,6 +10,13 @@
   samples. That is the whole workflow - training happened once, on another machine,
   and its result is committed here (README section "Generate text (CPU, no training)").
 
+  In -Chat mode the model plans inside a <think> ... </think> block on questions
+  that need several steps (the terminal prints the trace dimmed and the answer
+  normally), and arithmetic, word counts and date questions are answered by
+  tools.py exactly instead of being guessed at. -Doc FILE indexes a local
+  .txt/.md file in memory and answers from it (BM25 over chunks, no vector
+  database, no network).
+
   First-time setup, once per machine:
       python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
@@ -18,9 +25,10 @@
   .\run.ps1 -Prompt "Once upon a time" -N 250
   .\run.ps1 -Interactive                           # prompts without reloading weights
   .\run.ps1 -Chat                                  # instruction-tuned multi-turn chatbot
-  .\run.ps1 -Chat -Persona pirate                   # ...as a salty sea dog (friendly|pirate|math|storyteller|none)
+  .\run.ps1 -Chat -Persona pirate                   # ...as a salty sea dog (friendly|pirate|math|storyteller|reasoner|none)
   .\run.ps1 -Chat -SystemPrompt "You are a robot."  # ...with your own system prompt
-  .\run.ps1 -Chat -NoTools                          # ...without the calculator hook
+  .\run.ps1 -Chat -Doc .\notes.md                   # ...answering from your own document (local RAG)
+  .\run.ps1 -Chat -NoTools                          # ...without the calculator/python hook
   .\run.ps1 -Seed 4294967295                       # reproducible output
   .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
   .\run.ps1 -Int8                                  # force INT8 quantized checkpoint
@@ -45,6 +53,8 @@ param(
     [switch]$Interactive,
     [switch]$Chat,
     [switch]$NoTools,             # disable the calculator hook (math goes to the model)
+    [string]$Doc = "",            # chat: answer from this .txt/.md file (local retrieval)
+    [switch]$NoRag,               # chat: disable document retrieval entirely
     [switch]$Int8
 )
 
@@ -114,6 +124,8 @@ if ($Chat) { $genArgs += "--chat" }
 if ($Persona) { $genArgs += @("--persona", $Persona) }
 if ($SystemPrompt) { $genArgs += @("--system", $SystemPrompt) }
 if ($NoTools) { $genArgs += "--no-tools" }
+if ($Doc) { $genArgs += @("--doc", $Doc) }
+if ($NoRag) { $genArgs += "--no-rag" }
 if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
 
 & $exe @genArgs

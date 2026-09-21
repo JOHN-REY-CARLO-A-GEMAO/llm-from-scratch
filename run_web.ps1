@@ -9,8 +9,12 @@
   into the page as the model generates them; temperature and top-p are sliders in
   the UI, a System Prompt dropdown picks the persona, the header shows a live
   token counter / latency monitor, every message has Copy / Copy code buttons, and
-  the Clear Chat button wipes the conversation. Arithmetic ("5 + 5") is answered
-  by a real calculator instead of the model, which cannot add.
+  the Clear Chat button wipes the conversation. Arithmetic ("5 + 5"), word counts
+  and date questions are answered by real Python instead of the model; complex
+  questions come back with the model's <think> plan in a collapsible fold; and
+  "📄 Upload Document (.txt / .md)" (or -Doc FILE) indexes a file in
+  memory so the answers come from your own text - with the retrieved passages
+  listed under each reply.
 
   Uses the gradio frontend if gradio happens to be installed, otherwise the
   built-in zero-dependency interface - either way there is nothing extra to
@@ -28,7 +32,10 @@
   .\run_web.ps1 -Int8                           # force INT8 quantized checkpoint
   .\run_web.ps1 -Persona math                   # start on the Math Tutor persona
   .\run_web.ps1 -SystemPrompt "Be very terse."  # start with your own system prompt
-  .\run_web.ps1 -NoTools                        # disable the calculator hook
+  .\run_web.ps1 -Persona reasoner               # start on the Reasoner (thinking) persona
+  .\run_web.ps1 -Doc .\notes.md                 # preload a document for local Q&A
+  .\run_web.ps1 -NoTools                        # disable the calculator/python hook
+  .\run_web.ps1 -NoRag                          # disable document upload + retrieval
 
 .NOTES
   If script execution is blocked by policy, use run_web.bat (forwards every
@@ -43,7 +50,9 @@ param(
     [string]$Persona  = "",       # system prompt the page starts on
     [string]$SystemPrompt = "",   # free-text system prompt (wins over -Persona)
     [switch]$NoBrowser,
-    [switch]$NoTools,             # disable the calculator hook
+    [switch]$NoTools,             # disable the calculator/python hook
+    [string]$Doc     = "",       # preload a .txt/.md document for local Q&A
+    [switch]$NoRag,               # disable document upload + retrieval
     [switch]$Int8
 )
 
@@ -106,6 +115,8 @@ if ($NoBrowser) { $webArgs += "--no-browser" }
 if ($Persona) { $webArgs += @("--persona", $Persona) }
 if ($SystemPrompt) { $webArgs += @("--system", $SystemPrompt) }
 if ($NoTools) { $webArgs += "--no-tools" }
+if ($Doc) { $webArgs += @("--doc", $Doc) }
+if ($NoRag) { $webArgs += "--no-rag" }
 
 Write-Host "[web] starting the chat UI with $exe from $Ckpt (Ctrl+C stops it)" -ForegroundColor Cyan
 & $exe @webArgs
