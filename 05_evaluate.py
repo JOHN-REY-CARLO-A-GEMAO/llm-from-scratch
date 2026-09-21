@@ -40,7 +40,8 @@ GPT, GPTConfig = model_mod.GPT, model_mod.GPTConfig
 
 
 @torch.no_grad()
-def metrics(model, data: np.ndarray, batch_size: int, dev, max_blocks: int | None) -> dict:
+def metrics(model, data: np.ndarray, batch_size: int, dev, max_blocks: int | None,
+            autocast: bool = True) -> dict:
     """Next-token cross-entropy, teacher-forced, over held-out blocks."""
     model.eval()
     tot_loss, tot_tok, correct, tot_logp = 0.0, 0, 0, 0.0
@@ -52,7 +53,8 @@ def metrics(model, data: np.ndarray, batch_size: int, dev, max_blocks: int | Non
         # Identical autocast to the training loop: computing the "final" val loss in
         # fp32 while training reported bf16 made the two numbers disagree by ~1%,
         # which reads like a corrupted checkpoint. One dtype for both.
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=dev.type == "cpu"):
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16,
+                            enabled=autocast and dev.type == "cpu"):
             logits, _ = model(x)
         logits = logits.float()      # softmax/CE in fp32 on top of bf16 logits
         logp = F.log_softmax(logits, dim=-1)
@@ -93,6 +95,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--max-blocks", type=int, default=512)
     ap.add_argument("--plot", default="out/curves.png")
+    ap.add_argument("--autocast", choices=["bf16", "none"], default="bf16",
+                    help="must match the setting 04_train.py ran with, or the val loss here will "
+                         "not reproduce the checkpoint-selection numbers (see 04_train.py)")
     args = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,9 +108,10 @@ def main() -> None:
 
     tok = _load("01_tokenizer").ByteLevelBPE.load(args.tokenizer)
     data = np.load(Path(args.data_dir) / f"{args.split}.npy", mmap_mode="r")
-    print(f"[eval] {args.split} blocks={data.shape[0]:,} vocab={cfg.vocab_size}")
+    print(f"[eval] {args.split} blocks={data.shape[0]:,} vocab={cfg.vocab_size} "
+          f"precision={'bf16 autocast' if args.autocast == 'bf16' else 'fp32'}")
 
-    m = metrics(model, data, args.batch_size, dev, args.max_blocks)
+    m = metrics(model, data, args.batch_size, dev, args.max_blocks, args.autocast == "bf16")
 
     # tokens-per-byte on the corpus itself, to get a tokenizer-free metric
     corpus = Path("data/corpus.txt").read_text(encoding="utf-8")[:200_000]
@@ -121,8 +127,14 @@ def main() -> None:
     print(f"[base] uniform          ppl = {cfg.vocab_size:,}")
     print(f"[base] unigram          ppl = {bl['unigram_ppl']:.2f}")
     print(f"[base] bigram Markov    ppl = {bl['bigram_ppl']:.2f}")
+    # Report both gaps: perplexity is what people quote, cross-entropy is what the
+    # model actually minimises, and the two differ a lot on a log scale (a 50% ppl
+    # win is a 13% loss win). Printing only one of them is how "we beat the
+    # baseline" gets heard as a bigger result than it is.
     print(f"[base] this model       ppl = {m['val_ppl']:.2f}   "
-          f"({100*(1-m['val_loss']/bl['bigram_loss']):.1f}% better than the bigram floor)")
+          f"({100*(1-m['val_ppl']/bl['bigram_ppl']):.1f}% lower ppl, "
+          f"{100*(1-m['val_loss']/bl['bigram_loss']):.1f}% lower cross-entropy, "
+          f"vs the bigram floor)")
 
     out = {**m, "bpb": bpb, "tok_per_byte": tok_per_byte, "baselines": bl}
     Path(args.ckpt).parent.joinpath("eval.json").write_text(json.dumps(out, indent=2, default=str))

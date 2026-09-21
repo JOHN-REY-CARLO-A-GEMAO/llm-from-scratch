@@ -1,71 +1,87 @@
 <#
 .SYNOPSIS
-  One-command entry point: train the tiny CPU model if needed, then generate text.
+  One command: generate text from the pre-trained model on the CPU.
+  No training, no GPU, no dataset - just the checkpoint committed to this repo.
 
 .DESCRIPTION
-  First run trains the small "out_fast" model (30 iters, d_model 96, 2 layers -
-  under a minute on a modern laptop CPU), then samples from it. Later runs reuse
-  the existing checkpoint and just generate.
+  `out/model_best.pt` (1.9 M params, ~8 MB) ships with the repository, so this
+  script never trains anything: it checks your Python + PyTorch, then samples
+  from the checkpoint. That is the whole workflow - training happened once, on
+  another machine, and its result is committed here (README section "Generate
+  text (CPU, no training)").
 
-  Works on Windows PowerShell 5.1 and PowerShell 7. If script execution is
-  blocked by policy, use:  powershell -NoProfile -ExecutionPolicy Bypass -File run.ps1
-  or just double-click run.bat.
+  First-time setup, once per machine:
+      python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 .EXAMPLE
-  .\run.ps1                                          # default prompt, 200 tokens
-  .\run.ps1 -Prompt "Once upon a time" -N 150
-  .\run.ps1 -Eval                                    # also print eval ppl
-  .\run.ps1 -Retrain                                 # wipe out_fast, train fresh
+  .\run.ps1                                        # default prompt, 150 tokens, temp 0.8
+  .\run.ps1 -Prompt "Once upon a time" -N 250
+  .\run.ps1 -Seed 1337                             # reproducible output
+  .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
+
+.NOTES
+  If script execution is blocked by policy, use run.bat (forwards every
+  argument) or:
+      powershell -NoProfile -ExecutionPolicy Bypass -File run.ps1
 #>
 param(
-    [string]$Prompt  = "It was a dark and stormy night",
-    [int]$N          = 200,      # tokens to generate
-    [double]$Temp    = 0.8,
-    [int]$TopK       = 50,
-    [string]$OutDir  = "out_fast",
-    [string]$Python  = "python", # or a full path to python.exe
-    [switch]$Eval,               # also run 05_evaluate.py (val ppl)
-    [switch]$Retrain             # delete $OutDir and train from scratch
+    [string]$Prompt = "It was a dark and stormy night",
+    [int]   $N      = 150,        # tokens to generate
+    [double]$Temp   = 0.8,
+    [int]   $TopK   = 50,
+    [double]$TopP   = 0.9,
+    [int]   $Seed   = -1,         # -1 = random (the seed used is printed)
+    [string]$Ckpt   = "out/model_best.pt",
+    [string]$Python = "python"
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
-$ckpt = Join-Path $OutDir "model_best.pt"
-$cfg  = Join-Path $OutDir "config.txt"
+# Windows consoles default to a legacy code page; the model emits curly quotes
+# and em dashes, which would otherwise come out as mojibake or raise
+# UnicodeEncodeError. Set the encoding before Python starts.
+$env:PYTHONIOENCODING = "utf-8"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-# --- sanity checks: python and torch present? --------------------------------
-if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
-    throw "python executable '$Python' not found on PATH. Edit the -Python parameter or install Python."
+# --- 1. find an interpreter -------------------------------------------------
+$exe = $null
+foreach ($cand in @($Python, "python", "python3", "py")) {
+    if ($cand -and (Get-Command $cand -ErrorAction SilentlyContinue)) { $exe = $cand; break }
 }
-& $Python -c "import torch"
+if (-not $exe) {
+    Write-Host "[run] No Python found on PATH (tried: $Python, python, python3, py)." -ForegroundColor Red
+    Write-Host "      Install Python 3.10+ from https://python.org (tick 'Add python.exe to PATH'),"
+    Write-Host "      then re-run this script, or pass the path:  .\run.ps1 -Python C:\Python312\python.exe"
+    exit 1
+}
+
+# --- 2. is PyTorch installed? ----------------------------------------------
+& $exe -c "import torch" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    throw "PyTorch import failed. Install the CPU build with: pip install torch --index-url https://download.pytorch.org/whl/cpu"
+    Write-Host "[run] PyTorch is not importable by '$exe'. Install the CPU build (once):" -ForegroundColor Yellow
+    Write-Host "      $exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu"
+    exit 1
 }
 
-# --- get a checkpoint (train on first use) -----------------------------------
-if ($Retrain -and (Test-Path $OutDir)) {
-    Write-Host "[run] -Retrain given: removing $OutDir" -ForegroundColor Yellow
-    Remove-Item -Recurse -Force -LiteralPath $OutDir
+# --- 3. is the checkpoint there? -------------------------------------------
+if (-not (Test-Path -LiteralPath $Ckpt)) {
+    Write-Host "[run] Checkpoint '$Ckpt' not found." -ForegroundColor Yellow
+    Write-Host "      It is committed to this repository (~8 MB) - fetch it with:  git pull"
+    Write-Host "      (git pull must have completed; the file lives at out/model_best.pt)"
+    exit 1
 }
 
-if (-not (Test-Path $ckpt)) {
-    Write-Host "[run] no checkpoint in $OutDir - training the tiny model (about a minute on CPU) ..." -ForegroundColor Cyan
-    & $Python 04_train.py --iters 30 --batch-size 32 --grad-accum 1 `
-        --d-model 96 --n-layer 2 --n-head 3 --out-dir $OutDir
-    if ($LASTEXITCODE -ne 0) { throw "training failed (exit code $LASTEXITCODE)" }
-}
-else {
-    Write-Host "[run] reusing checkpoint $ckpt" -ForegroundColor DarkGray
+# --- 4. generate ------------------------------------------------------------
+Write-Host "[run] generating with $exe  (Ctrl+C stops it)" -ForegroundColor Cyan
+$genArgs = @("generate.py", "--ckpt", $Ckpt, "--prompt", $Prompt, "--n", $N,
+             "--temp", $Temp, "--top-k", $TopK, "--top-p", $TopP)
+if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
+
+& $exe @genArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[run] generation failed (exit code $LASTEXITCODE)." -ForegroundColor Red
+    exit $LASTEXITCODE
 }
 
-if ($Eval) {
-    & $Python 05_evaluate.py --ckpt $ckpt
-    if ($LASTEXITCODE -ne 0) { throw "evaluation failed (exit code $LASTEXITCODE)" }
-}
-
-# --- generate -----------------------------------------------------------------
-Write-Host ""
-Write-Host "[run] generating $N tokens (temp $Temp, top-k $TopK) ..." -ForegroundColor Cyan
-& $Python sample.py --ckpt $ckpt --config $cfg --prompt $Prompt --n $N --temp $Temp --top-k $TopK
-if ($LASTEXITCODE -ne 0) { throw "generation failed (exit code $LASTEXITCODE)" }
+Write-Host "[run] done. Change the prompt with:  .\run.ps1 -Prompt `"your text`" -N 250" -ForegroundColor DarkGray

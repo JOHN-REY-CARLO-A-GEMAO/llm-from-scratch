@@ -51,7 +51,8 @@ def get_batch(data: np.ndarray, size: int, device, gen: np.random.Generator) -> 
 
 
 @torch.no_grad()
-def evaluate(model, data, eval_batch, device, iters: int, eval_size: int) -> dict:
+def evaluate(model, data, eval_batch, device, iters: int, eval_size: int,
+             autocast: bool = True) -> dict:
     """Val loss on a *fixed* set of block indices -> comparable across steps.
 
     `iters` is derived from the data, never hard-coded blindly: an empty eval
@@ -76,7 +77,8 @@ def evaluate(model, data, eval_batch, device, iters: int, eval_size: int) -> dic
         ix = eval_batch[k * eval_size:(k + 1) * eval_size]
         blk = torch.from_numpy(np.asarray(data[ix], dtype=np.int64))
         x, y = blk[:, :-1].to(device), blk[:, 1:].to(device)
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=device.type == "cpu"):
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16,
+                            enabled=autocast and device.type == "cpu"):
             _, loss = model(x, y)
         tot_loss += loss.item() * y.numel()
         ntok += y.numel()
@@ -115,6 +117,12 @@ def main() -> None:
     ap.add_argument("--eval-iters", type=int, default=3)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--autocast", choices=["bf16", "none"], default="bf16",
+                    help="bf16 autocast on CPU (default) or plain fp32. bf16 only pays off on "
+                         "CPUs with native bf16 (AVX512-BF16 / AMX); without them PyTorch "
+                         "emulates it and a step can be ~5x SLOWER than fp32. On such a box pass "
+                         "--autocast none; the eval inside this script follows the same setting, "
+                         "so the val numbers stay comparable.")
     ap.add_argument("--compile", action="store_true", help="torch.compile the model")
     ap.add_argument("--resume", action="store_true",
                     help="restore model+optimizer+iteration from opt.pt (continues the schedule)")
@@ -130,7 +138,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[run] device={dev}  threads={torch.get_num_threads()}")
+    amp = args.autocast == "bf16"
+    print(f"[run] device={dev}  threads={torch.get_num_threads()}  "
+          f"precision={'bf16 autocast' if amp else 'fp32'}")
 
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     # Guard: a "best" checkpoint from a previous run must not be clobbered by a run
@@ -206,7 +216,8 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         for _ in range(args.grad_accum):
             x, y = get_batch(train, args.batch_size, dev, gen)
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=dev.type == "cpu"):
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16,
+                                enabled=amp and dev.type == "cpu"):
                 _, loss = model(x, y)
             (loss / args.grad_accum).backward()
             running += loss.item()
@@ -229,7 +240,8 @@ def main() -> None:
             t0 = time.time()
 
         if ((it + 1) % args.eval_every == 0) or it == args.iters - 1:
-            ev = evaluate(model, val, eval_batch, dev, args.eval_iters, args.batch_size_eval)
+            ev = evaluate(model, val, eval_batch, dev, args.eval_iters, args.batch_size_eval,
+                          autocast=amp)
             print(f"[  eval] iter {it+1:5d}  val_loss {ev['val_loss']:.4f}  "
                   f"val_ppl {ev['val_ppl']:.2f}")
             hist.append({"iter": it + 1, **ev})
