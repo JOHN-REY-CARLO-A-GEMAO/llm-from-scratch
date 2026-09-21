@@ -69,6 +69,49 @@ complete turns in the 256-token context, and stops as soon as `<|im_end|>` is
 sampled. Type `/clear` to discard history or `/exit` to leave. The base
 continuation mode and `out/model_best.pt` remain unchanged.
 
+#### System prompts (personas)
+
+A system turn is prepended as `<|im_start|>system\n...<|im_end|>`:
+
+```bash
+python generate.py --chat --persona pirate                       # preset
+python generate.py --chat --system "You are a terse robot."      # free text
+python generate.py --chat --persona none                         # no system turn
+```
+
+Presets are `friendly` (default), `pirate`, `math` and `storyteller`; the same
+list is the dropdown in the web UI, and `personas.py` is the single source of
+truth for both. Inside the REPL, `/persona` lists them, `/persona pirate`
+switches, `/system TEXT` sets free text and `/system` shows what is in force.
+The checkpoint was never fine-tuned on a system turn, so read this as tone
+steering rather than obedience; `--persona none` reproduces the exact framing
+`08_sft.py` trained on. Role markers typed into a prompt or a message
+(`<|im_start|>`, `<|im_end|>`, …) are stripped, so the turn structure is always
+assembled by the program.
+
+#### Calculator (arithmetic the model cannot do)
+
+`5 + 5` is not a language question, so it is not asked of the model. An explicit
+arithmetic question is evaluated with `tools.py` (a whitelisted `ast` walk —
+never `eval`) and answered exactly:
+
+```bash
+python generate.py --chat
+You> 5 + 5
+[calc] '5 + 5' -> 5 + 5 = 10 (computed locally; the model was not asked)
+Assistant> 5 + 5 = 10
+You> what is 12 * 4?
+Assistant> 12 plus 4 is 20
+
+🧮 12 * 4 = 48
+```
+
+Three paths, one rule — the exact value always appears: a bare expression is
+answered locally; a math question inside prose gets the model's reply *plus* the
+computed line; and if the model writes `<<calc: 5 + 5>>`, the marker is replaced
+by `10` while it streams. Arithmetic is exact rational (`0.1 + 0.2` is `0.3`,
+integers stay integers), and `--no-tools` disables the hook entirely.
+
 The committed `data/sft/chat_sft.jsonl` contains 6,000 deterministic synthetic
 instruction-response pairs (greetings, children's animal questions, everyday
 explanations, kindness, arithmetic, and tiny stories). Each row includes the
@@ -95,7 +138,9 @@ until a complete character is ready, so Unicode doesn't break during streaming.
 
 The same chat checkpoint is also wrapped in a dark-mode web interface —
 tokens stream into the page as they are generated, **Temperature** (0.1–1.5)
-and **Top-P** (0.1–1.0) are sliders, and **Clear Chat** wipes the history:
+and **Top-P** (0.1–1.0) are sliders, a **System Prompt** dropdown (🤖 Friendly
+Assistant, 🏴‍☠️ Pirate, 🧮 Math Tutor, 🏰 Storyteller, ✏️ Custom…, ∅ None) steers
+the persona, and **Clear Chat** wipes the history:
 
 ```powershell
 .\run_web.ps1       # Windows: serve + open the browser  (double-click run_web.bat also works)
@@ -112,9 +157,21 @@ It loads `out/model_chat.pt` + `out/model_chat_config.json`, uses a **gradio**
 to a built-in zero-dependency `http.server` page when it is not — nothing extra
 to install beyond PyTorch. Endpoints: `GET /` (the page), `POST /api/chat`
 (newline-delimited JSON token stream), `POST /api/stop`, `GET /api/info`.
-Multi-turn history, the `<|im_start|>` framing, and context trimming behave
-exactly like the terminal chat above. `--backend stdlib|gradio|auto`,
-`--no-browser`, `--port`, and `--host` adjust the launch.
+Multi-turn history, the `<|im_start|>` framing, the system turn, the calculator
+and context trimming behave exactly like the terminal chat above — the browser
+posts `{message, history, temperature, top_p, system, persona}` and the server
+re-serialises the whole prompt with the same code the REPL uses.
+`--backend stdlib|gradio|auto`, `--no-browser`, `--port`, `--host`,
+`--persona NAME`, `--system TEXT` and `--no-tools` adjust the launch
+(`--persona` / `--system` set which persona the page starts on).
+
+Beyond the chat itself the page carries three things the terminal cannot show:
+a **token counter / latency monitor** in the header (live tokens, tok/s and
+elapsed time while streaming; then time-to-first-token, prompt size, stop reason
+and seed for the finished turn, plus session totals), **Copy / Copy response /
+Copy code** buttons on every message, and the persona picker. A `<<calc: …>>`
+substitution or a locally computed answer is labelled `🧮` in the message meta,
+so a computed number is never mistaken for a sampled one.
 
 For a persistent prompt session:
 
@@ -160,7 +217,9 @@ knobs) for machines that also have the training environment.
 07_make_sft.py         deterministic 6,000-example children's assistant dataset
 08_sft.py              response-only-loss SFT from model_best.pt (250 steps)
 generate.py            continuation + multi-turn chat CLI (CPU, torch-only deps)
-web_ui.py              browser chat UI: token streaming, temp/top-p sliders, clear button
+web_ui.py              browser chat UI: streaming, persona picker, latency monitor, copy buttons
+personas.py            system-prompt presets, marker sanitising, prompt shrinking
+tools.py               safe calculator: AST whitelist, math detection, <<calc: …>> substitution
 run.ps1 / run.bat      one-click Windows launchers for generate.py
 run_web.ps1 / .bat     one-click Windows launchers for the browser chat UI
 sample.py              research generation CLI

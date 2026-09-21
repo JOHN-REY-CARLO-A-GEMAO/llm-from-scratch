@@ -32,6 +32,12 @@ Design notes, each of which is a real inference-time bug it avoids:
    mix-up shows up as a shape error, so it is checked *before* generating.
  * threads pinned to the physical core count: PyTorch defaults to 1 thread in
    some environments, which quietly makes CPU generation several times slower.
+
+Chat mode additionally supports a **system prompt** (`--persona`, `--system`,
+and `/persona` / `/system` inside the REPL) and a **calculator hook**
+(`--no-tools` disables it). Both are shared with `web_ui.py` — `personas.py`
+builds the `<|im_start|>system` block and `tools.py` evaluates arithmetic — so
+the terminal and the browser send byte-identical prompts.
 """
 from __future__ import annotations
 
@@ -45,6 +51,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:            # the stage files are importable by name
     sys.path.insert(0, str(HERE))
+
+import personas                          # noqa: E402  (stdlib-only, torch-free)
+import tools                             # noqa: E402
+
+IM_START, IM_END = personas.IM_START, personas.IM_END
 
 
 def die(msg: str) -> None:
@@ -120,14 +131,34 @@ class TokenStream:
 
     Decoding each token separately would turn split curly quotes/emoji into
     replacement characters. Finalise at document boundaries just like render().
+
+    `tool_filter` (optional) rewrites the text on its way out, which is where a
+    model-emitted `<<calc: 5 + 5>>` becomes `10`. Everything written is also
+    collected in `written`, so the caller can keep exactly what the user saw as
+    the assistant turn for the next round.
     """
 
-    def __init__(self, tok, unicode_to_bytes):
+    def __init__(self, tok, unicode_to_bytes, tool_filter=None):
         self.tok = tok
         self.to_bytes = unicode_to_bytes
         self.special = {tok.token_to_id[s] for s in tok.special_tokens}
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.n_special = 0
+        self.tool_filter = tool_filter
+        self.written: list[str] = []
+
+    def _emit(self, text: str) -> None:
+        self.written.append(text)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def _write(self, text: str) -> None:
+        if self.tool_filter is None:
+            self._emit(text)                 # unchanged path when tools are off
+            return
+        text = self.tool_filter.feed(text)
+        if text:
+            self._emit(text)
 
     def __call__(self, token_id: int) -> None:
         if token_id in self.special:
@@ -136,13 +167,13 @@ class TokenStream:
             self.n_special += 1
         else:
             text = self.decoder.decode(self.to_bytes(self.tok.id_to_token[token_id]))
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        self._write(text)
 
     def finish(self) -> None:
-        sys.stdout.write(self.decoder.decode(b"", final=True))
-        sys.stdout.flush()
+        self._write(self.decoder.decode(b"", final=True))
         self.decoder.reset()
+        if self.tool_filter is not None:      # release anything the filter held back
+            self._emit(self.tool_filter.finish())
 
 
 def run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
@@ -189,58 +220,142 @@ def run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
         print(f"[gen] seed {seed}  (re-run with --seed {seed} to reproduce this text)")
 
 
+def serialize_chat(system: str, turns, user: str) -> str:
+    """The exact SFT template, plus an optional leading system turn.
+
+    `system` is inserted as `<|im_start|>system\\n…<|im_end|>` before the first
+    user turn. `web_ui.ChatEngine.serialize` calls this same function, so the
+    browser and the terminal cannot format a conversation differently.
+    """
+    parts = [f"{IM_START}system\n{system}{IM_END}"] if system else []
+    parts += [f"{IM_START}user\n{u}{IM_END}\n{IM_START}assistant\n{a}{IM_END}"
+              for u, a in turns]
+    parts.append(f"{IM_START}user\n{user}{IM_END}\n{IM_START}assistant\n")
+    return "\n".join(parts)
+
+
+def initial_system(args) -> tuple[str, str]:
+    """Resolve `--persona` / `--system` (the latter wins) to `(label, text)`.
+
+    Defaulting to the friendly persona matches the web UI's default selection;
+    `--persona none` or `--system ""` sends no system block at all, which is the
+    framing the checkpoint was actually fine-tuned on.
+    """
+    value = getattr(args, "system", None)
+    if value is None:
+        value = getattr(args, "persona", None)
+    return personas.resolve(value, tool_hint=not getattr(args, "no_tools", False))
+
+
 def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
     """Conversational REPL using the same serialization as SFT.
 
     Complete user/assistant turns are retained until the context fills. Older
-    turns are removed as units, rather than slicing through a role marker.
+    turns are removed as units, rather than slicing through a role marker — and
+    the system block is the *last* thing to shrink, because it is the only part
+    of the prompt the user did not type just now.
+
+    Arithmetic never reaches the model: an explicit math question is answered by
+    `tools.py`, and a `<<calc: …>>` marker the model does emit is substituted
+    with the exact value while the answer streams.
     """
-    im_start, im_end = "<|im_start|>", "<|im_end|>"
     try:
-        end_id = tok.token_to_id[im_end]
-        tok.token_to_id[im_start]
+        end_id = tok.token_to_id[IM_END]
+        tok.token_to_id[IM_START]
     except KeyError:
         die("chat tokenizer is missing <|im_start|>/<|im_end|>. "
             "Run 08_sft.py or pass --tokenizer tokenizer/chat.")
-    specials = [im_start, im_end]
+    specials = [IM_START, IM_END]
+    tools_on = not getattr(args, "no_tools", False)
+    label, system = initial_system(args)
     history: list[tuple[str, str]] = []
     if not args.quiet:
         print("[chat] Multi-turn chat mode. Type /exit or /quit to leave; /clear resets history.")
+        print("[chat] /system <text> sets a system prompt, /persona <name> picks a preset "
+              "(/persona lists them).")
+        n_system = len(tok.encode_with_specials(system, specials)) if system else 0
+        print(f"[chat] system prompt: {label}" + (f"  ({n_system} tokens)" if n_system
+                                                  else "  (none)"))
+
+    def encode(prompt_system: str, turns) -> list[int]:
+        return tok.encode_with_specials(
+            serialize_chat(prompt_system, turns, user), specials)
 
     while True:
         try:
             user = input("\nYou> " if not args.quiet else "")
-            command = user.strip().lower()
-            if command in {"/exit", "/quit", "exit", "quit"}:
+            command = user.strip()
+            lower = command.lower()
+            if lower in {"/exit", "/quit", "exit", "quit"}:
                 break
-            if command == "/clear":
+            if lower == "/clear":
                 history.clear()
                 if not args.quiet:
                     print("[chat] History cleared.")
                 continue
+            if lower == "/persona" or lower.startswith("/persona "):
+                name = command[len("/persona"):].strip()
+                if not name:
+                    print("[chat] Presets: " + ", ".join(
+                        f"{p.slug} ({p.label})" for p in personas.PERSONAS) +
+                        f", none.  Current: {label}")
+                    continue
+                label, system = personas.resolve(name, tool_hint=tools_on)
+                if not args.quiet:
+                    print(f"[chat] system prompt: {label}")
+                continue
+            if lower == "/system" or lower.startswith("/system "):
+                text = command[len("/system"):].strip()
+                if not text:
+                    print(f"[chat] system prompt ({label}): "
+                          + (system if system else "<none>"))
+                    continue
+                label, system = personas.resolve(text, tool_hint=tools_on)
+                if not args.quiet:
+                    print(f"[chat] system prompt: {label}")
+                continue
             if not user.strip():
                 continue
 
-            def serialize(turns):
-                done = [f"{im_start}user\n{u}{im_end}\n{im_start}assistant\n{a}{im_end}"
-                        for u, a in turns]
-                current = f"{im_start}user\n{user}{im_end}\n{im_start}assistant\n"
-                return "\n".join(done + [current])
+            # ---- tool hook: a bare arithmetic question never reaches the model.
+            # A math question inside prose is still answered by the model (it can
+            # be part of a bigger question) — the exact value is appended after.
+            query = tools.find_math_question(user) if tools_on else None
+            if query is not None and query.bare:
+                answer = query.answer         # "5 + 5 = 10", computed exactly
+                if not args.quiet:
+                    print(f"[calc] {query.expression!r} -> {answer} (computed locally; "
+                          f"the model was not asked)")
+                    print("Assistant> " + answer, flush=True)
+                else:
+                    print(answer, flush=True)
+                history.append((user, answer))
+                continue
 
-            prompt = serialize(history)
-            prompt_ids = tok.encode_with_specials(prompt, specials)
+            prompt_ids = encode(system, history)
             # Leave useful room for an answer and discard oldest complete turns.
             reserve = min(args.n, max(32, cfg.block_size // 3))
             while history and len(prompt_ids) > cfg.block_size - reserve:
                 history.pop(0)
-                prompt = serialize(history)
-                prompt_ids = tok.encode_with_specials(prompt, specials)
+                prompt_ids = encode(system, history)
+            if system and len(prompt_ids) > cfg.block_size - reserve:
+                # Even an empty history does not fit: shrink the system block
+                # rather than let prefill silently drop it (and the question).
+                system = personas.shrink(
+                    system, lambda text: len(encode(text, history)),
+                    cfg.block_size - reserve)
+                prompt_ids = encode(system, history)
+                if not args.quiet:
+                    print(f"[chat] system prompt trimmed to "
+                          f"{len(tok.encode_with_specials(system, specials))} tokens "
+                          f"to fit the {cfg.block_size}-token context.")
 
             seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
             params = gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k,
                                             top_p=args.top_p,
                                             repeat_penalty=args.repeat_penalty, seed=seed)
-            stream = TokenStream(tok, tok_mod.unicode_to_bytes)
+            tool_filter = tools.ToolTextFilter() if tools_on else None
+            stream = TokenStream(tok, tok_mod.unicode_to_bytes, tool_filter)
             if not args.quiet:
                 print("Assistant> ", end="", flush=True)
 
@@ -251,16 +366,27 @@ def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
                     stream(token_id)
 
             try:
-                ids, _, _ = gen_mod.generate(
+                # the return value is not needed: the assistant turn is what the
+                # (tool-filtered) stream actually printed
+                gen_mod.generate(
                     model, prompt_ids, args.n, params, use_cache=True, eos_id=end_id,
                     device=device, block_size=cfg.block_size, on_token=emit)
             finally:
                 stream.finish()
                 print(flush=True)
-            generated = ids[len(prompt_ids):]
-            if generated and generated[-1] == end_id:
-                generated = generated[:-1]
-            answer = tok.decode(generated).strip()
+            if tool_filter is not None and tool_filter.calls:
+                if not args.quiet:
+                    print("[calc] substituted " + ", ".join(c.line for c in tool_filter.calls)
+                          + " into the reply")
+            # The assistant turn is what the user saw, tool results included.
+            answer = "".join(stream.written).strip()
+            if query is not None and not tools.value_in_text(query.calculation, answer):
+                # The model answered a math question with a number of its own
+                # invention: the exact value goes with it, every time, so the
+                # user is never left with only the guess.
+                extra = f"\n\n🧮 {query.answer}"
+                answer += extra
+                print(extra, flush=True)
             history.append((user, answer))
         except (EOFError, KeyboardInterrupt):
             print()
@@ -315,6 +441,15 @@ def main() -> None:
                     help="read prompts in a REPL without reloading weights; ignores --prompt")
     ap.add_argument("--chat", action="store_true",
                     help="instruction-tuned multi-turn chat REPL (implies --interactive)")
+    ap.add_argument("--persona", default=None, metavar="NAME",
+                    help="chat system prompt preset: friendly (default), pirate, math, "
+                         "storyteller, none. Also settable with /persona in the REPL")
+    ap.add_argument("--system", default=None, metavar="TEXT",
+                    help="free-text system prompt, overriding --persona ('' for none). "
+                         "/system TEXT changes it mid-conversation")
+    ap.add_argument("--no-tools", dest="no_tools", action="store_true",
+                    help="disable the calculator: arithmetic questions go to the model "
+                         "and <<calc: …>> markers are shown as written")
     args = ap.parse_args()
     if args.chat:
         args.interactive = True
@@ -418,6 +553,10 @@ def main() -> None:
         if getattr(tok_mod, "_regex", None) is None:
             print("[gen] note: `regex` is not installed, so the stdlib word-splitting pattern is "
                   "used (pip install regex for byte-identical prompt tokenisation).")
+
+    if not args.chat and (args.persona is not None or args.system is not None or args.no_tools):
+        print("[gen] note: --persona / --system / --no-tools only apply to chat mode "
+              "(--chat).", file=sys.stderr)      # stderr: --quiet output stays clean
 
     if args.chat:
         chat_repl(args, model, cfg, tok, tok_mod, gen_mod, dev)

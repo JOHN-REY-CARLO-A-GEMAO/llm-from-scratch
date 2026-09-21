@@ -7,7 +7,10 @@
   Starts web_ui.py on http://127.0.0.1:7860 (also bound on 0.0.0.0:7860, so other
   devices on your LAN can reach it) and opens your default browser. Tokens stream
   into the page as the model generates them; temperature and top-p are sliders in
-  the UI, and the Clear Chat button wipes the conversation.
+  the UI, a System Prompt dropdown picks the persona, the header shows a live
+  token counter / latency monitor, every message has Copy / Copy code buttons, and
+  the Clear Chat button wipes the conversation. Arithmetic ("5 + 5") is answered
+  by a real calculator instead of the model, which cannot add.
 
   Uses the gradio frontend if gradio happens to be installed, otherwise the
   built-in zero-dependency interface - either way there is nothing extra to
@@ -23,6 +26,9 @@
   .\run_web.ps1 -NoBrowser                      # serve only, do not open a tab
   .\run_web.ps1 -Python "C:\Python312\python.exe"   # pick a specific interpreter
   .\run_web.ps1 -Int8                           # force INT8 quantized checkpoint
+  .\run_web.ps1 -Persona math                   # start on the Math Tutor persona
+  .\run_web.ps1 -SystemPrompt "Be very terse."  # start with your own system prompt
+  .\run_web.ps1 -NoTools                        # disable the calculator hook
 
 .NOTES
   If script execution is blocked by policy, use run_web.bat (forwards every
@@ -34,7 +40,10 @@ param(
     [string]$BindHost    = "0.0.0.0",
     [string]$Ckpt     = "",
     [string]$Python   = "python",
+    [string]$Persona  = "",       # system prompt the page starts on
+    [string]$SystemPrompt = "",   # free-text system prompt (wins over -Persona)
     [switch]$NoBrowser,
+    [switch]$NoTools,             # disable the calculator hook
     [switch]$Int8
 )
 
@@ -94,6 +103,9 @@ if (-not (Test-Path -LiteralPath $configPath)) { $configPath = "out/config.json"
 $webArgs = @("web_ui.py", "--host", $BindHost, "--port", $Port, "--ckpt", $Ckpt)
 if ($Int8) { $webArgs += "--quantized" }
 if ($NoBrowser) { $webArgs += "--no-browser" }
+if ($Persona) { $webArgs += @("--persona", $Persona) }
+if ($SystemPrompt) { $webArgs += @("--system", $SystemPrompt) }
+if ($NoTools) { $webArgs += "--no-tools" }
 
 Write-Host "[web] starting the chat UI with $exe from $Ckpt (Ctrl+C stops it)" -ForegroundColor Cyan
 & $exe @webArgs
