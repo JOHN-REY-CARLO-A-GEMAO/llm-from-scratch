@@ -7,7 +7,14 @@ file. Deliberately **no numpy, no matplotlib, no regex requirement** (the
 tokenizer falls back to stdlib `re`), and no GPU code path: what you measure
 here is the model, not the harness.
 
-    python generate.py --prompt "It was a dark and stormy night" --n 150 --temp 0.8
+    python generate.py --prompt "Once upon a time, there was a little girl named Lily" --n 150
+
+The architecture is Llama-3 style (RMSNorm, RoPE, SwiGLU, SDPA — see
+`03_model.py`), which matters here in one concrete way: there is no learned
+position-embedding table, positions are rotated into q/k. A KV cache therefore
+has to rotate each new token by its *absolute* position while leaving the
+already-rotated cached keys alone; `03_model.py` does that, and
+`tests/test_architecture.py` pins it.
 
 Design notes, each of which is a real inference-time bug it avoids:
 
@@ -205,7 +212,7 @@ def main() -> None:
     ap.add_argument("--ckpt", default="out/model_best.pt", help="checkpoint (.pt) to load")
     ap.add_argument("--config", default=None, help="default: config.json/config.txt next to --ckpt")
     ap.add_argument("--tokenizer", default="tokenizer", help="directory holding bpe.pkl")
-    ap.add_argument("--prompt", default="It was a dark and stormy night",
+    ap.add_argument("--prompt", default="Once upon a time, there was a little girl named Lily",
                     help="text to continue; '' starts from the model's document token")
     ap.add_argument("-n", "--n", "--tokens", dest="n", type=int, default=150,
                     help="number of new tokens to sample")
@@ -269,6 +276,8 @@ def main() -> None:
               f"{ckpt.stat().st_size / 1e6:.1f} MB)")
         print(f"[gen] config {cfg_path}  ({cfg.n_layer} layers, {cfg.n_head} heads, "
               f"d_model {cfg.d_model}, context {cfg.block_size}, vocab {cfg.vocab_size})")
+        print(f"[gen] arch   RMSNorm + RoPE(base {getattr(cfg, 'rope_base', 10000.0):g}) + SwiGLU + "
+              f"scaled_dot_product_attention, pre-norm, tied embeddings")
         print(f"[gen] tokenizer {tok_dir}  (vocab {tok.vocab:,})")
         if getattr(tok_mod, "_regex", None) is None:
             print("[gen] note: `regex` is not installed, so the stdlib word-splitting pattern is "

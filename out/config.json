@@ -4,5 +4,7 @@
   "n_layer": 4,
   "n_head": 5,
   "d_model": 160,
-  "dropout": 0.0
+  "dropout": 0.0,
+  "rope_base": 10000.0,
+  "rms_norm_eps": 1e-05
 }

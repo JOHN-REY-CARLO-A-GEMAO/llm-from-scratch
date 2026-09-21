@@ -4,10 +4,12 @@
 
 Every code block in this guide is from the working files in this folder, and every number
 reported was produced by actually running them. The model in `out/` was trained on a 2-core CPU
-box in about 8 minutes (400 steps, fp32, ~7,300 tok/s), so the run is small by design — the
+box in about 33 minutes (1,400 steps, fp32, ~8,600 tok/s), so the run is small by design — the
 *pipeline* is what transfers to scale, not the model size. That checkpoint is committed, which is
 why `run.ps1` can generate text on a laptop without training anything; §9 has its numbers and
-`out/MODEL_CARD.md` has its limits.
+`out/MODEL_CARD.md` has its limits. The architecture is Llama-3 style (RMSNorm, RoPE, SwiGLU,
+`scaled_dot_product_attention`); §5 explains each choice, including what the earlier GPT-2-style
+version of this file did differently and why it changed.
 
 ---
 
@@ -15,10 +17,10 @@ why `run.ps1` can generate text on a laptop without training anything; §9 has i
 
 | | this guide | GPT-3 class |
 |---|---|---|
-| parameters | 1.9 M | 175 B |
-| training tokens | 0.37 M | 300 B |
+| parameters | 1.93 M | 175 B |
+| training tokens | 11.5 M | 300 B |
 | context window | 256 | 2048 |
-| result | fluent sentences, no facts, no instruction-following | general ability |
+| result | coherent little stories, no facts, no instruction-following | general ability |
 
 Two consequences that shape every later decision:
 
@@ -64,20 +66,50 @@ makes a CPU run 2–8× slower; set it explicitly (`04_train.py` does `torch.set
 
 ## 2. Data collection
 
-**Source.** Three public-domain books from Project Gutenberg (~1.4 MB of prose): *Sherlock Holmes*,
-*Pride and Prejudice*, *Alice in Wonderland*. Small, clean, English, no licence friction.
+**Source: TinyStories** (Eldan & Li, 2023, [arXiv:2305.07759](https://arxiv.org/abs/2305.07759)) —
+~2.1 M synthetically written children's stories in deliberately simple English, distributed as a
+single 2.2 GB `.txt` on the HuggingFace Hub. `00_tinystories.py` **streams** it (HTTP range reads,
+bye-bye 2.2 GB download), keeps ~20 MB of clean stories, and writes `data/tinystories/corpus.txt`.
 
-```python
-import urllib.request
-for url, name in [("https://www.gutenberg.org/files/1661/1661-0.txt", "sherlock.txt"),
-                  ("https://www.gutenberg.org/files/1342/1342-0.txt", "pride.txt"),
-                  ("https://www.gutenberg.org/files/11/11-0.txt",     "alice.txt")]:
-    urllib.request.urlretrieve(url, f"data/raw/{name}")
+```bash
+python 00_tinystories.py --source hf-http --out data/tinystories --max-bytes $((32<<20)) --max-chars 20000000
 ```
 
-**Design decision: corpus choice dominates model choice at this scale.** With 1.4 MB you are
-training a *style* model. If you want a model that reasons about code, use a code corpus; if you
-want dialogue, use transcripts. Do not expect general knowledge from literature alone.
+Why this corpus and not, say, Shakespeare: **corpus choice dominates model choice at this scale.**
+A 2 M-parameter model cannot learn general knowledge from 11 M tokens, but TinyStories was *designed*
+so that small models can learn to write coherent English from it — the vocabulary is ~1.5 k words,
+sentences are short, every story has a beginning, a middle and an end. It makes the difference
+between "the pipeline works" and "fluent sentences, no structure".
+
+Cleaning is the whole job here, and it is not optional. This dump contains:
+
+1. **Mojibake** — `â€œ` for a curly quote (a UTF-8 → cp1252 → UTF-8 round trip). 72,430 characters
+   of it in the 20 MB slice we keep. Repairing the exact byte sequences is safe; guessing is not.
+2. **Lost story separators** — where `<|endoftext|>` was eaten, two stories are glued into one
+   sentence: `"...she was happy.Once upon a time, ..."`. A story opener printed immediately after a
+   sentence end is the tell, and that is where the splitter cuts.
+3. **Truncated stories, unicode noise, Prompt-GPT artifacts** — filtered by the length,
+   sentence-structure, non-ASCII-budget and letter-ratio checks in `clean_story()`.
+4. **Duplicates.** The dump is not uniformly unique; a naive slice-and-shuffle can hand you the
+   same story thousands of times. `build_corpus()` deduplicates by content hash (blake2b) and
+   reports what it dropped.
+
+The unit of the corpus is a *story*, not a paragraph. Getting this wrong is subtle: splitting on
+blank lines yields 136-character fragments (median) because dialogue and the moral of a story are
+separate paragraphs; 84% of them then fail the length filter. `split_stories()` therefore cuts at
+sentence boundaries in front of an opener and re-groups the pieces into 300–2000-character stories,
+which keeps 25,147 stories (1.6% rejected).
+
+```
+[data] raw text 61,976,042 chars from local:/tmp/ts_train.txt
+[data] wrote data/tinystories/corpus.txt (20.0 MB, 25,147 stories, mean 795 chars)
+[data] rejected 400 of 25,547 raw chunks
+```
+
+(The classic Gutenberg path still exists — three public-domain books in `data/raw/`, cleaned by
+`clean_gutenberg()` and packed with `python 02_preprocess.py --mode docs`. It is a fine *style*
+corpus, and it is what the earlier 400-step checkpoint in this repo's history was trained on, but
+`--mode stream` on TinyStories is what the shipped model uses.)
 
 **Cleaning (`02_preprocess.py`).** Four things, in order:
 
@@ -230,28 +262,40 @@ Bigger vocabulary is not simply better:
 - and your tokenizer has to *encode* with it — a pure-Python BPE is ~1000× slower than
   HuggingFace's Rust `tokenizers`, which caps the merges you can afford at 100% vocab.
 
-**4,096 was the right choice for 1.4 MB of text.** Rough guide: you want ≥ ~50 tokens of training
-data per vocabulary entry, and 1.4M chars / 4 ≈ 380k tokens / 4096 ≈ 90. Fine. 50k (GPT-2's size)
-here would mean 7 tokens per entry — mostly dead embeddings.
+**4,096 was the right choice for 20 MB of text.** Rough guide: you want ≥ ~50 tokens of training
+data per vocabulary entry, and 20M chars / 4.5 ≈ 4.4M tokens / 4096 ≈ 1,080. Comfortable. 50k
+(GPT-2's size) would still be defensible — TinyStories' ~1.5k-word vocabulary compresses well — but
+it would put 8 M of a 2 M-parameter model's budget into the embedding matrix.
 
 Measured outcome:
 
 ```
+[tok] 3,839/3,839 merges  182.4/s  eta 0s
 [tok] final vocab = 4096
 [tok] self-test passed: round-trip on text + arbitrary bytes; no UNK path needed
-[tok] 42 tokens for 160 chars -> 3.81 chars/token
+[tok] 34 tokens for 160 chars -> 4.71 chars/token
+[tok] compression on the corpus: 4.49 chars/token
 ```
 
-**3.81 chars/token** — GPT-2's 50k BPE gets ~4.0 on English. A 4k vocabulary at 3.81 is the
-payoff of tuning size to corpus. (Note: my first measured value was 1.09 chars/token, which was
-not a tokenizer flaw but the 268-vocab bug above — a reminder to always measure compression.)
+**4.49 chars/token** — GPT-2's 50k BPE gets ~4.0 on general English, so a 4k vocabulary *tuned to
+this corpus* beats it on simplicity of text. (Note: an earlier run of this pipeline measured 1.09
+chars/token, which was not a tokenizer flaw but a vocabulary that ignored its merges — a reminder
+to always measure compression.)
 
 ```bash
-python 01_tokenizer.py --corpus data/corpus.txt --out tokenizer --vocab 4096 --train-chars 400000
+python 01_tokenizer.py --corpus data/tinystories/corpus.txt --out tokenizer --vocab 4096 --train-chars 4000000
 ```
 
-`--train-chars` caps the sample because merge statistics saturate quickly — training a tokenizer
-on 400 KB vs 1.4 MB gives near-identical merges for a fraction of the cost.
+`--train-chars` caps the sample because merge statistics saturate quickly: 4 M characters (55 s here)
+gives essentially the same 3,839 merges as the full 20 MB.
+
+**Encoding speed is a separate problem from training speed.** The textbook encoder replays all 3,839
+merges against every word — correct, and unusable at corpus scale. `encode(fast=True)` (the default)
+instead merges the *lowest-ranked adjacent pair* until none is left, which is the same function
+computed in O(len²) per word, plus a cache of word → pieces (~10⁴ distinct words in a 20 MB corpus,
+10⁶ occurrences). `encode_reference()` keeps the slow version, and
+`tests/test_tokenizer_encoding.py` asserts both produce identical ids on 46 real stories — a fast
+path that disagrees with the reference is how a corpus silently stops matching its vocabulary.
 
 ---
 
@@ -292,9 +336,9 @@ That last one is the whole objective function in one line: *the target is the in
 by one.* If that's wrong, your model learns nothing and your loss will hover near `ln(V)` forever.
 
 ```bash
-python 02_preprocess.py --corpus data/corpus.txt --tokenizer tokenizer --out data/shuffled --block-size 256
-[data] train: 371,354 tokens, 1,182 blocks of 257
-[data] val:    18,759 tokens,    60 blocks of 257
+python 02_preprocess.py --corpus data/tinystories/corpus.txt --tokenizer tokenizer --out data/packed --mode stream
+[data] train: 23,890 stories, 4,144,892 tokens, 16,190 blocks of 256 -> data/packed/train.npy
+[data] val:    1,257 stories,   216,121 tokens,    844 blocks of 256 -> data/packed/val.npy
 [data] sanity: OK
 ```
 
@@ -335,19 +379,35 @@ depth, tolerates less warmup. Every modern training recipe uses it.
 ### Attention
 
 ```python
-q, k, v = self.qkv(x).split(D, dim=2)
-q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)   # [B,H,T,Dh]
-k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)   # [B,H,T,Dh]
+k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)         # rotate by position
-q = q * (1.0 / math.sqrt(self.head_dim))                         # scale BEFORE attention
+q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)   # rotate q,k by position; never v
 
-att = q @ k.transpose(-2, -1) + self.attn_bias + mask            # mask = additive -inf triangle
-att = self.drop(att.softmax(dim=-1))
-y = (att @ v).transpose(1, 2).reshape(B, T, D)
-return self.proj(y)
+# one fused kernel for scale + causal mask + softmax + matmul:
+y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+return self.o_proj(y.transpose(1, 2).reshape(B, T, D))
 ```
+
+That is four lines where the GPT-2 version of this file had nine, and it is measurably faster:
+SDPA fuses the causal mask into the kernel (nothing of size `T×T` is materialised) and lets
+PyTorch pick a flash-attention-style CPU/CUDA implementation. Measured on this box, the whole
+model: **0.950 s/step vs 1.162 s/step** for the hand-written path at the same shapes.
+
+The cost is that the mask is no longer a single object you can pass around, and the three cases
+have to be handled explicitly — this is the one place where the modern code is easier to get
+*wrong* than the old one:
+
+| case | mask |
+|---|---|
+| no cache (training, prefill) | `is_causal=True` |
+| one new token, warm cache | none: `is_causal=False` and *no* mask — the single query must see every cached key |
+| T > 1 against a warm cache (chunked prefill) | explicit bool mask `j <= i + past` ("bottom-right" causal) |
+
+`is_causal=True` with `q_len=1` keeps only the *first* key, which would silently turn decoding
+into nonsense — `tests/test_architecture.py` and the chunked-prefill invariant in `03_model.py`
+pin all three cases.
 
 Design notes:
 
@@ -365,16 +425,20 @@ Design notes:
   starts), and it degrades gracefully past the training window instead of catastrophically.
   Learned `wpe`, as in GPT-2, is the simpler alternative — fine at this scale, strictly worse for
   length extrapolation.
-- **No output bias on `proj`, but a learnable per-head attention bias.** QKV biases mostly cancel
-  in the softmax; the per-head logit bias (`attn_bias`) acts as a learnable temperature and helps
-  attention sharpen early in training. Costs nothing at inference.
+- **No biases anywhere in q/k/v/o.** q/k/v biases either cancel in the softmax or shift q
+  uniformly. The earlier version of this file kept a learnable per-head logit bias as a temperature;
+  it is gone, because Llama-3 has none and the depth-scaled init below makes it unnecessary.
 
 ### MLP: SwiGLU
 
 ```python
-hidden = int(2 * (4 * d_model) / 3); hidden = 8 * ((hidden + 7) // 8)   # 8/3 of 4x, rounded to 8
-return self.down(F.silu(self.gate(x)) * self.up(x))
+hidden = 64 * ((int(8 * d_model / 3) + 63) // 64)      # 8/3 * d_model, up to a multiple of 64
+return self.drop(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 ```
+
+(The names are Llama-3's; at `d_model=160` this is `hidden=448`, i.e. 1.4 M of the model's
+1.9 M parameters live here. Rounding to a multiple of 64 matters for tensor-core efficiency on
+GPUs and vectorisation on CPUs.)
 
 Gated linear unit with SiLU. Three weight matrices instead of two, so width shrinks by 2/3 to
 keep FLOPs equal to a 4× ReLU MLP — and at matched FLOPs it wins. Rounding to a multiple of 8
@@ -386,7 +450,7 @@ matters for tensor-core efficiency on GPUs (and vectorisation on CPUs).
 self.lm_head.weight = self.wte.weight
 ```
 
-One matrix serves input and output. Saves `vocab × d_model` parameters (1.4 M of 1.9 M here!) and
+One matrix serves input and output. Saves `vocab × d_model` parameters (655 k of 1.93 M here) and
 measurably helps small models, where the output distribution and the input representation want
 similar structure. Cost: the two roles pull the matrix in different directions, which is why very
 large models untie them.
@@ -395,9 +459,10 @@ large models untie them.
 
 ```python
 self.apply(self._init_weights)          # N(0, 0.02) for Linear/Embedding, zero biases, unit norm gains
+scale = 1.0 / math.sqrt(2 * cfg.n_layer)
 for block in self.blocks:
-    nn.init.zeros_(block.attn.proj.weight)      # zero-init every residual-branch output
-    nn.init.zeros_(block.mlp.down.weight)
+    nn.init.normal_(block.attn.o_proj.weight, std=0.02 * scale)     # depth-scaled
+    nn.init.normal_(block.mlp.down_proj.weight, std=0.02 * scale)
 scale = 1.0 / math.sqrt(2 * cfg.n_layer)        # control residual-stream variance growth
 for block in self.blocks:
     for p in (block.attn.proj.weight, block.mlp.down.weight):
@@ -429,13 +494,17 @@ untied embeddings would make it ~40%.)
 ### Verifying the architecture (run `python 03_model.py`)
 
 ```
-[model] params=184,332  init loss=6.196 vs ln(V)=6.238
+[model] params=192,960  init loss=6.259 vs ln(V)=6.238
 [model] causality test passed (future tokens cannot leak into the past)
-[model] KV-cache vs full forward: max abs diff = 1.19e-07
+[model] RoPE relative-position invariance: max abs diff = 7.15e-07
+[model] SDPA vs explicit attention: max abs diff = 3.26e-09
+[model] KV-cache vs full forward (1 token): max abs diff = 1.79e-07
+[model] chunked prefill vs full forward: max abs diff = 2.38e-07
 [model] all invariants hold
 ```
 
-Three tests I'd insist on for any transformer you write yourself:
+Six tests I'd insist on for any transformer you write yourself — the last three only exist because
+the architecture is Llama-style:
 
 1. **Initial loss ≈ ln(V)** — catches head/embedding scale errors.
 2. **Causality**: corrupt the suffix of the input, assert the prefix's logits are bit-identical.
@@ -444,7 +513,14 @@ Three tests I'd insist on for any transformer you write yourself:
    implementation failed this: I built RoPE for `start+T` positions but applied it to only the new
    `T` tokens, and the mismatch broadcast the sequence to length `T+start`. The correct rule —
    cached k/v are *already rotated*, so slice `cos[start:start+T]` — is commented in the file.
-   Bug class caught: 1.19e-07 agreement after the fix.
+   Bug class caught: 1.79e-07 agreement after the fix. The **chunked-prefill** case (feed
+   `[0:20)` then `[20:32)` and compare with one 32-token pass) is the same test one level deeper:
+   it exercises the explicit bottom-right causal mask that `is_causal=True` cannot express.
+4. **RoPE is relative**: rotate q and k by the same offset and the attention logits must not move.
+   If someone "simplifies" the rotation into an absolute embedding, this fails immediately.
+5. **SDPA == explicit attention**: same projections, same rotation, then a hand-written
+   `softmax(qk^T/√d + mask)`. 3e-09 agreement is what tells you the fused kernel is doing what you
+   think, including where you *didn't* pass a mask.
 
 ---
 
@@ -652,7 +728,7 @@ return torch.softmax(x, dim=-1)
 - **top-k alone is wrong** because k is fixed: after `"The capital of France is"` the distribution
   is peaked and k=5 is plenty; after `"Once upon a"` it is flat and k=5 truncates good
   continuations. Our test shows the effect: `top-p=0.9` keeps **2 tokens** on a peaked
-  distribution and **94** on a flat one. *That adaptivity is the entire argument for nucleus
+  distribution and **158** on a flat one. *That adaptivity is the entire argument for nucleus
   sampling.*
 - **top-p** keeps the smallest set with cumulative mass ≥ p. Use it with top-k as a safety cap
   (p=0.9, k=50) so a pathological tail can't dominate.
@@ -702,138 +778,75 @@ python sample.py --prompt "It was a dark and stormy night" --n 200 --temp 0.8 --
 
 ## 9. Results
 
-**The first run — 150 steps, bf16, on a 2 CPU core / 2 GB RAM box:** 1.9M params, 4096 vocab,
-256-token context, effective batch 32 sequences. It saw 1.23 M training tokens ≈ 4 epochs.
-It did *not* clear the bigram gate, and the section ends by saying so. The *shipped* checkpoint
-(400 steps, fp32) is the next subsection; this one is kept because the honest mid-training
-numbers are the useful part.
+**The shipped checkpoint** — 1.93 M parameters, Llama-3 style, 4096-token byte-level BPE, 256-token
+context, trained on 20 MB of clean TinyStories for **1,400 steps × 8,192 tokens = 11.5 M tokens**
+(≈2.8 epochs over the 4.14 M-token train split) on 2 CPU cores in **33 minutes** at fp32
+**~8,600 tok/s**:
 
 ```
-iter   0    loss 8.307    (ln(4096) = 8.318 — the uniform baseline; init verified in 25 ms)
-iter  25    loss 7.273
-iter  50    loss 6.376
-iter  75    loss 5.860    val_ppl 218.6  -> checkpoint saved as model_75.pt
-iter 100    loss 5.584
-iter 125    loss 5.400
-iter 149    loss 5.367    (LR at its cosine floor 6.0e-5)
-iter 150    val_loss 5.3851  val_ppl 218.13
+[run] device=cpu  threads=2  precision=fp32
+[run] params 1,926,560 (34% in the embedding)  flops/token 3,197,760
+[opt] 1,925,120/1,926,560 params get weight decay (99.9%)
+[run] train blocks 16,190  val blocks 844
 
-[eval] val loss 5.2912 | ppl 198.58 | top-1 19.49% | bits/byte 2.015 (0.264 tok/byte)
-[base] uniform ppl 4,096 | unigram ppl 736 | bigram Markov ppl 178.89
-[base] this model ppl 198.58   -> beats unigram 3.7x, but does NOT yet beat bigram
+[train] iter     0/1400  loss 8.3584  lr 1.00e-05  gnorm 1.35  7,333 tok/s   # ln(4096) = 8.318
+[train] iter   100/1400  loss 4.9005  lr 1.00e-03  gnorm 0.55  7,118 tok/s
+[train] iter   400/1400  loss 3.1569  lr 8.87e-04  gnorm 0.80  7,719 tok/s
+[train] iter   800/1400  loss 2.7591  lr 4.96e-04  gnorm 0.98  7,955 tok/s
+[train] iter  1200/1400  loss 2.3761  lr 1.52e-04  gnorm 0.96  8,197 tok/s
+[train] iter  1399/1400  loss 2.4299  lr 1.00e-04  gnorm 1.02  8,771 tok/s
+[  eval] iter  1400       val_loss 2.5663  val_ppl 13.02            <- out/model_best.pt
+
+[  eval] iter   100  val_loss 4.8810  val_ppl 131.76     <- crosses the bigram floor almost at once
+[  eval] iter   400  val_loss 3.2065  val_ppl  24.69
+[  eval] iter   800  val_loss 2.7640  val_ppl  15.86
+[  eval] iter  1200  val_loss 2.5975  val_ppl  13.43
+[  eval] iter  1400  val_loss 2.5663  val_ppl  13.02
 ```
 
-**The bigram gate says the model is not finished, and it is right.** 198.6 vs 178.9 means it
-still has not clearly learned to use more than one token of context. Beating unigram by 3.7× and
-losing to a Markov chain is a completely ordinary place for 1.9M params and 1.2M tokens to be;
-this corpus is ~0.4M tokens, so one more epoch of LR-schedule *completion* (not just more steps)
-is what would move it. I'd rather hand you that than quietly compare against unigram instead.
-
-### The shipped checkpoint — 400 steps, fp32 (this is `out/model_best.pt`)
-
-Same 1.9M-param model, same corpus, same schedule shape — more steps to the *end* of the cosine
-(the first run stopped at the halfway point of its schedule, which is why its LR never decayed).
-2 CPU cores, ~8 minutes wall clock, **3.28 M tokens** (≈11 epochs over the 0.30 M-token train
-split), fp32 at **~7,300 tok/s**:
+Full metrics from `05_evaluate.py` (`out/eval.json`), plus the baselines that give them meaning:
 
 ```
-[train] iter     0/400  loss 8.3072  lr 1.50e-05  gnorm 0.83  6,100 tok/s
-[  eval] iter    50     val_loss 6.3597  val_ppl 578.05     <- checkpoint saved
-[  eval] iter   100     val_loss 5.3654  val_ppl 213.88     <- still worse than bigram (178.9)
-[  eval] iter   150     val_loss 4.9416  val_ppl 139.99     <- crosses the bigram floor
-[  eval] iter   200     val_loss 4.7306  val_ppl 113.36
-[  eval] iter   250     val_loss 4.6162  val_ppl 101.11
-[  eval] iter   300     val_loss 4.5478  val_ppl  94.42
-[  eval] iter   350     val_loss 4.5090  val_ppl  90.83
-[  eval] iter   400     val_loss 4.4949  val_ppl  89.56     <- out/model_best.pt
-
-[eval] val loss 4.4949 | ppl 89.56 | top-1 24.73% | bits/byte 1.712 (0.264 tok/byte)
-[base] uniform ppl 4,096 | unigram ppl 736.25 | bigram Markov ppl 178.89
-[base] this model ppl = 89.56   (49.9% lower ppl, 13.3% lower cross-entropy, vs the bigram floor)
+[eval] val loss 2.5826 | ppl 13.23 | top-1 45.26% | bits/byte 0.830 (0.223 tok/byte)
+[base] uniform          ppl = 4,096
+[base] unigram          ppl = 613.28
+[base] bigram Markov    ppl = 52.84
+[base] this model       ppl = 13.23   (75.0% lower ppl, 34.9% lower cross-entropy, vs the bigram floor)
 ```
 
-**What this pair actually shows, and what it does not.** The two runs differ in three ways at
-once — 400 vs 150 steps, fp32 vs emulated bf16, warmup 40 vs 30 — so resist reading a single cause
-into the gap. The defensible reading is (a) the shipped model wins on every measure (val ppl 89.6
-vs 198.6, top-1 24.7% vs 19.5%, bits/byte 1.712 vs 2.015) and (b) the one variable with a clean
-mechanism behind it is **tokens to the end of the cosine**: 3.28 M vs 1.23 M. If you want to
-attribute the rest, re-run 400 steps with and without `--autocast bf16` and compare — I have not,
-so I am not claiming the precision did it, even though "bf16 emulation is 5× slower *and* adds
-rounding noise" is a plausible story. This is the same discipline the bigram gate enforces:
-measure, then attribute.
+(The trainer's own eval uses a fixed 32,768-token window and reports 2.5663 / ppl 13.02 —
+the same weights, a smaller sample of the same held-out stories; `05_evaluate.py` scores
+512 of the 844 val blocks, i.e. 131,072 tokens, and is the number to quote.)
 
-One schedule note that *is* worth carrying forward: at iteration 150 of the 400-step schedule the
-model already sat at train loss 5.01, while the 150-step run ended its *fully annealed* schedule at
-5.37. An un-annealed model halfway through a longer run beat a fully annealed short one, because
-8× the steps remain. When someone reports a loss, the schedule position is part of the number.
+Read those four numbers in order, because that is the whole point of the section:
 
-Generation, same prompt and settings as above but 150 tokens, `--temp 0.8 --seed 1337`, KV cache,
-376–390 tok/s on 2 threads (unedited):
+1. **Uniform** (4,096) is where we started; the init test pinned it at 8.3584 vs `ln(4096)=8.318`.
+2. **Unigram** (613.28) is "sample tokens by their frequency". Any model that cannot beat this is
+   broken, not untrained.
+3. **Bigram Markov** (52.84) is the real gate: one token of context, no network. It is crossed
+   before iter 100 and ends **4× below it** (`ppl` 13.23 vs 52.84).
+4. **This model** (13.23) adds a 256-token window of context (and 1.9 M parameters of
+   representation) on top of that single-token count. It is trained on 11.5 M tokens,
+   i.e. ~2.8 epochs.
 
-```
-It was a dark and stormy night at the cars of his taced at the lock that his a man might be only
-all an good, and the tramoning fug.”
+An honest caveat: TinyStories is a *simple* distribution. These perplexities are not comparable to
+a Wikipedia-trained model's, and the generation below is coherent but semantically shallow (a
+"kitten" can become a "bunny" two sentences later). What the run does demonstrate is everything the
+pipeline is supposed to: the loss starts at `ln(V)`, beats the Markov floor, keeps improving until
+the LR schedule ends, and the checkpoint produces grammatical, story-shaped English.
 
-“I was so much of some unppeconer.”
-
-“And it did you be a few few minutes,’ said he. “How is sofgs for the stlient. You think which I
-have been in the pusing?’
-
-“If I cannot be in the clue or in his hand?” He cried. “My bay to look. The rooms which may be as
-much from Miss Holmes, and I can ask that for
-```
-
-Compare with the 150-step text above: real words (`minutes`, `cried`, `rooms`, `Holmes`), stable
-dialogue scaffolding, and still nonsense in the content slots. That is the correct *shape* of
-progress at this budget — fluency of form first, meaning last.
-
-Trainer-vs-`05` cross-check, same weights: `5.3851` vs `5.2912`. Different by design — the trainer
-scores 32 of the 60 val blocks (its batch size is clamped to divide them exactly) while `05` scores
-all 60. Don't let anyone tell you "val loss" is a single unambiguous number; state the subset.
-
-Generation (200 tokens, `--temp 0.8 --seed 5`, unedited):
-
-```
-Mr. Holmes examined the letter closely the house.”
-
-“I am I had been in the little I are the family.”
-
-“I could not give it is that he was been a bppent and all we would not do with her ly,ing to
-be so uned. He was the young bing an two. “No, my her their being not know which I had be to
-his great few very c of a day but the other of your ll in his your pan. There a most med with
-very very froing and to her own all at the house, and what were that he knowing the first on
-this one of him as her the most most tered or at Holmge, he had a such a saa, but. It is a sed
-```
-
-Correct dialogue formatting — new paragraph, curly quote opened, and a closing quote with the
-period *inside* it (a Victorian convention absorbed with no instruction), plus `Holmge`, a
-mangled "Holmes". Grammar and spelling inside the sentences are broken, as they must be at
-0.4 M tokens. This is a language model that has learned the *layout and register* of English prose
-and not yet its syntax — which is precisely the thing to check when you build your own.
-
-Measured KV-cache effect, 200 tokens, both cores free: **0.54 s cached vs 1.66 s uncached (3.1×)**,
-generation at 376 tok/s, and exact (`cached == uncached`). The shipped checkpoint samples at a
-similar ~386 tok/s on 2 threads (150 tokens in 0.41 s, including the prompt prefill).
-
-A metric worth keeping for byte-level BPE models — broken-UTF-8 rate (the model emitted a lone
-continuation byte of a multi-byte sequence):
-
-```
-iter 100 (4.0 epochs): 48/3,320 = 1.45%
-iter 120 (4.9 epochs): 14/3,461 = 0.40%
-iter 150 (full sched): 30/3,423 = 0.88%
-```
-
-Note it did **not** fall monotonically. That is the honest lesson: this is a noisy
-quality proxy on 5 fixed prompts, not a benchmark. It caught the *catastrophic* case (1.45%) and
-it would be wrong to tune against it — which is true of every cheap generation metric.
+For comparison with the repo's earlier life: the same 1.9 M parameters trained on 1.44 MB of
+Project Gutenberg prose (400 steps, 3.28 M tokens) reached val loss 4.4949 / ppl 89.56 / top-1
+24.7% / 1.712 bits-per-byte. **Same architecture family, same compute order — 7× the data, a
+cleaner corpus and 3.5× the steps is the difference between "fluent but lost" and "a story".**
+That is the argument of §0 in one line.
 
 ## 10. Scaling this up: what actually changes
 
 | stage | at this scale | at 1B+ params |
 |---|---|---|
 | tokenizer | pure-Python BPE is fine | Rust `tokenizers`/`tiktoken`, ~1000× faster; vocab 32–128k |
-| data | 1.4 MB, one process | TB-scale, dedup + quality filtering, web-scale mixing, tokenise offline into shards (this pipeline's shape, at 10⁶× the size) |
+| data | 20 MB, one process | TB-scale, dedup + quality filtering, web-scale mixing, tokenise offline into shards (this pipeline's shape, at 10⁶× the size) |
 | precision | bf16 autocast (fp32 if the CPU can't do bf16 natively) | bf16 + FSDP/ZeRO, activation checkpointing |
 | parallelism | none | tensor + pipeline + data parallel |
 | attention | masked softmax | FlashAttention (fused, avoids materialising T×T) |
@@ -866,16 +879,19 @@ Five things worth stealing from production recipes:
 | file | contents |
 |---|---|
 | `_stage.py` | import shim (module names can't start with a digit) |
+| `00_tinystories.py` | stream TinyStories (~32 MB), clean it, write ~20 MB corpus + provenance |
 | `01_tokenizer.py` | byte-level BPE, train/encode/decode/save + self-tests + `check_invariants` |
 | `02_preprocess.py` | corpus cleaning, document split, block packing, memmap, sanity checks |
-| `03_model.py` | GPT config + RoPE/RMSNorm/SwiGLU transformer + optimizer + invariant tests |
+| `03_model.py` | Llama-3 style transformer (RMSNorm/RoPE/SwiGLU/SDPA) + optimizer + invariant tests |
 | `04_train.py` | training loop, LR schedule, eval, checkpointing |
 | `05_evaluate.py` | loss/ppl/accuracy/bpb, unigram + bigram baselines, loss curve |
 | `06_generate.py` | sampling (temp/top-k/top-p/repeat-penalty) + KV cache |
 | `sample.py` | generation CLI (research: every knob, cached-vs-uncached timing) |
 | `generate.py` | inference-only CLI: CPU, torch-only deps, no training code paths |
 | `run.ps1` / `run.bat` | one-click Windows launchers for `generate.py` |
-| `data/corpus.txt`, `data/shuffled/` | cleaned corpus, tokenised blocks |
+| `data/tinystories/` | cleaned TinyStories corpus (20 MB, committed) + `stats.json` provenance |
+| `data/packed/` | tokenised uint16 blocks, story-level train/val split (committed) |
+| `data/raw/` | the three Gutenberg books, for `--mode docs` |
 | `tokenizer/`, `out/` | vocabulary, the committed checkpoint + `config.*`, `log.jsonl`, `eval.json`, `MODEL_CARD.md` |
 
 ## 12. The bugs, catalogued

@@ -40,6 +40,8 @@ else:  # stdlib `re` has no unicode property escapes
     PAT = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\w+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+""")
 
 # ------------------------------------------------------------------ byte map
+DOC_END = "<|doc_end|>"   # the one separator token this project uses
+
 BYTES = bytes(range(256))
 # The code points we are allowed to use as byte stand-ins: printable ASCII plus
 # a block of Latin-1 code points that essentially never occur in real text.
@@ -83,6 +85,9 @@ class ByteLevelBPE:
         self.merges: list[tuple[str, str]] = []
         self.token_to_id: dict[str, int] = {}
         self.id_to_token: dict[int, str] = {}
+        self._ranks: dict[tuple[str, str], int] = {}
+        self._word_cache: dict[str, list[str]] = {}
+        self._cache_limit = 400_000        # words cached during encode(); ~10^4 is typical
 
     # ---------------------------------------------------------------- vocabulary
     def _build_vocab(self) -> None:
@@ -95,6 +100,11 @@ class ByteLevelBPE:
             if tok not in self.token_to_id:
                 self.token_to_id[tok] = len(self.token_to_id)
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
+        # (a, b) -> merge rank, the fast encoder's lookup table. Rebuilt with the
+        # vocabulary, and the word cache is dropped: its entries belong to the
+        # previous merge list.
+        self._ranks = {pair: i for i, pair in enumerate(self.merges)}
+        self._word_cache: dict[str, list[str]] = {}
 
     @staticmethod
     def _pair_counts(sp: list[str]) -> Counter:
@@ -205,14 +215,56 @@ class ByteLevelBPE:
         print("[tok] bookkeeping invariants hold (per-word counts == global weighted table)")
 
     # ---------------------------------------------------------------- encoding
-    def encode(self, text: str) -> list[int]:
-        """Split, then apply merges in learned order.
+    def _encode_word(self, word: str) -> list[str]:
+        """Canonical BPE for one pre-token: repeatedly merge the adjacent pair
+        with the lowest merge rank (leftmost wins a tie).
 
-        This is the reference implementation: O(len x n_merges) per word, which
-        is fine for a demo and for pre-tokenising a small corpus. Production
-        tokenizers precompute a trie/regex and run ~1000x faster for the same
-        vocabulary and identical output.
+        This is *equivalent* to replaying the merge list in learned order (see
+        encode_reference) — the earliest merge in the list is by construction the
+        lowest-ranked adjacent pair — but it costs O(len^2) dict lookups per word
+        instead of O(n_merges * len) list scans. At 4096 merges that is the
+        difference between minutes and hours for a 20 MB corpus.
         """
+        ranks = self._ranks
+        sp = list(word)
+        while len(sp) > 1:
+            best_i, best_rank = -1, None
+            for i in range(len(sp) - 1):
+                r = ranks.get((sp[i], sp[i + 1]))
+                if r is not None and (best_rank is None or r < best_rank):
+                    best_i, best_rank = i, r
+            if best_i < 0:
+                break
+            sp[best_i:best_i + 2] = [sp[best_i] + sp[best_i + 1]]
+        return sp
+
+    def encode(self, text: str, fast: bool = True) -> list[int]:
+        """Split into pre-tokens, then BPE each one.
+
+        `fast=True` (default) uses the rank-based merge with a per-word cache:
+        the corpus has ~10^4 distinct words but ~10^6 word occurrences, so
+        caching turns the whole job into one regex pass plus dict lookups.
+        `fast=False` runs the reference loop. tests/test_tokenizer_encoding.py
+        pins the two to be identical on real corpus text.
+        """
+        if not fast:
+            return self.encode_reference(text)
+        ids: list[int] = []
+        cache = self._word_cache
+        token_to_id = self.token_to_id
+        for m in PAT.finditer(bytes_to_unicode(text.encode("utf-8"))):
+            word = m.group()
+            piece = cache.get(word)
+            if piece is None:
+                piece = self._encode_word(word)
+                if len(cache) < self._cache_limit:      # bound memory
+                    cache[word] = piece
+            ids.extend(token_to_id[t] for t in piece)
+        return ids
+
+    def encode_reference(self, text: str) -> list[int]:
+        """Textbook encoder: O(len x n_merges) per word. Slow, obviously correct,
+        kept as the oracle that the fast path is tested against."""
         ids: list[int] = []
         for m in PAT.finditer(bytes_to_unicode(text.encode("utf-8"))):
             word = m.group()
@@ -234,7 +286,8 @@ class ByteLevelBPE:
             ids.extend(self.token_to_id[t] for t in sp)
         return ids
 
-    def encode_with_specials(self, text: str, specials: list[str]) -> list[int]:
+    def encode_with_specials(self, text: str, specials: list[str],
+                             fast: bool = True) -> list[int]:
         """Special tokens must survive as single ids, never as BPE fragments,
         so split on them *before* running BPE and splice their ids back in."""
         pat = "(" + "|".join(re.escape(s) for s in specials) + ")"
@@ -245,7 +298,7 @@ class ByteLevelBPE:
             if part in specials:
                 ids.append(self.token_to_id[part])
             else:
-                ids.extend(self.encode(part))
+                ids.extend(self.encode(part, fast=fast))
         return ids
 
     def decode(self, ids: list[int]) -> str:

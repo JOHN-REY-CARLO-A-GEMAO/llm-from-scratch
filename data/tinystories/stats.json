@@ -1,0 +1,18 @@
+{
+  "source_stories": 25547,
+  "stories": 25147,
+  "chars": 20000601,
+  "mean_story_chars": 795.3,
+  "max_chars_total": 20000000,
+  "rejected": 400,
+  "dataset": "TinyStories (Eldan & Li 2023, arXiv:2305.07759), TinyStoriesV2-GPT4 train split",
+  "source": "local",
+  "source_url": "local:/tmp/ts_train.txt",
+  "dataset_url": "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt",
+  "sha256": "c7ccddd9ea1a24bcbebffae802c11a83281d149ed2aed274d585a378da1e433a",
+  "bytes_on_disk": 20006203,
+  "separator": "<|doc_end|>",
+  "min_story_chars": 200,
+  "max_story_chars": 2500,
+  "dedupe": true
+}

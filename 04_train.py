@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 import math
 import os
 import time
@@ -87,37 +88,44 @@ def evaluate(model, data, eval_batch, device, iters: int, eval_size: int,
     return {"val_loss": val_loss, "val_ppl": math.exp(val_loss), "val_tokens": ntok}
 
 
-def write_cfg(out: Path, vocab: int, args) -> None:
+def write_cfg(out: Path, cfg) -> None:
     """Config travels with the weights: a checkpoint is useless if you cannot
-    reconstruct the exact architecture it was trained with."""
-    (out / "config.txt").write_text(json.dumps({
-        "vocab_size": vocab, "block_size": args.block_size, "n_layer": args.n_layer,
-        "n_head": args.n_head, "d_model": args.d_model, "dropout": args.dropout}, indent=2))
+    reconstruct the exact architecture it was trained with.
+
+    Both files are written from the *model's* config (not from a hand-picked
+    subset of the CLI args), so they can never drift from the architecture that
+    was actually built: config.json is read by generate.py, config.txt is the
+    historical name the earlier stages used. Same content, two names."""
+    text = json.dumps(asdict(cfg), indent=2)
+    (out / "config.json").write_text(text)
+    (out / "config.txt").write_text(text)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default="data/shuffled")
+    ap.add_argument("--data-dir", default="data/packed")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--block-size", type=int, default=256)
-    ap.add_argument("--d-model", type=int, default=192)
-    ap.add_argument("--n-layer", type=int, default=6)
-    ap.add_argument("--n-head", type=int, default=6)
+    ap.add_argument("--d-model", type=int, default=160)
+    ap.add_argument("--n-layer", type=int, default=4)
+    ap.add_argument("--n-head", type=int, default=5)
     ap.add_argument("--dropout", type=float, default=0.0)
-    ap.add_argument("--lr", type=float, default=6e-4)
+    ap.add_argument("--rope-base", type=float, default=10_000.0,
+                    help="RoPE frequency base; raise to 1e5..5e5 to stretch context")
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--min-lr-frac", type=float, default=0.1)
     ap.add_argument("--beta1", type=float, default=0.9)
     ap.add_argument("--beta2", type=float, default=0.95)
     ap.add_argument("--weight-decay", type=float, default=0.1)
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--grad-accum", type=int, default=1)
-    ap.add_argument("--iters", type=int, default=1500)
+    ap.add_argument("--iters", type=int, default=1400)
     ap.add_argument("--warmup", type=int, default=100)
-    ap.add_argument("--eval-every", type=int, default=200)
+    ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--eval-iters", type=int, default=3)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--autocast", choices=["bf16", "none"], default="bf16",
+    ap.add_argument("--autocast", choices=["bf16", "none"], default="none",
                     help="bf16 autocast on CPU (default) or plain fp32. bf16 only pays off on "
                          "CPUs with native bf16 (AVX512-BF16 / AMX); without them PyTorch "
                          "emulates it and a step can be ~5x SLOWER than fp32. On such a box pass "
@@ -156,7 +164,8 @@ def main() -> None:
     vocab = meta["vocab"]
 
     cfg = GPTConfig(vocab_size=vocab, block_size=args.block_size, n_layer=args.n_layer,
-                    n_head=args.n_head, d_model=args.d_model, dropout=args.dropout)
+                    n_head=args.n_head, d_model=args.d_model, dropout=args.dropout,
+                    rope_base=args.rope_base)
     model = GPT(cfg).to(dev)
     if args.compile:
         model = torch.compile(model)
@@ -249,17 +258,17 @@ def main() -> None:
             # is "best" has nothing to show for every step after the best one -- and on a
             # short run "best" is often just an early fluke of the fixed eval window.
             torch.save(model.state_dict(), out / f"model_{it+1}.pt")
-            write_cfg(out, vocab, args)
+            write_cfg(out, cfg)
             if ev["val_loss"] < best:
                 best = ev["val_loss"]
                 torch.save(model.state_dict(), out / "model_best.pt")
-                write_cfg(out, vocab, args)
+                write_cfg(out, cfg)
                 print(f"[  eval] new best -> saved to {out}/model_best.pt")
 
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "iter": args.iters - 1,
                 "best_val": best}, out / "opt.pt")
     torch.save(model.state_dict(), out / "model_last.pt")
-    write_cfg(out, vocab, args)
+    write_cfg(out, cfg)
     hist_path.write_text("\n".join(json.dumps(h) for h in hist))
     (out / "run_config.json").write_text(json.dumps(vars(args), indent=2))
     print(f"[run] done. best val_loss {best:.4f} (ppl {math.exp(best):.2f})")
