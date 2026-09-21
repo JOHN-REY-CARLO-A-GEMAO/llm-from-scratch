@@ -4,7 +4,7 @@
   No training, no GPU, no dataset - just the checkpoint committed to this repo.
 
 .DESCRIPTION
-  `out/model_best.pt` (1.9 M params, ~8 MB) ships with the repository, so this
+  `out/model_best.pt` (1.9 M params, ~8 MB, Llama-3 style) ships with the repository, so this
   script never trains anything: it checks your Python + PyTorch, then samples
   from the checkpoint. That is the whole workflow - training happened once, on
   another machine, and its result is committed here (README section "Generate
@@ -26,7 +26,7 @@
       powershell -NoProfile -ExecutionPolicy Bypass -File run.ps1
 #>
 param(
-    [string]$Prompt = "It was a dark and stormy night",
+    [string]$Prompt = "Once upon a time, there was a little girl named Lily",
     [int]   $N      = 150,        # tokens to generate
     [double]$Temp   = 0.8,
     [int]   $TopK   = 40,

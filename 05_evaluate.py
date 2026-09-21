@@ -89,13 +89,15 @@ def baselines(train: np.ndarray, val: np.ndarray, vocab: int) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/model_best.pt")
-    ap.add_argument("--data-dir", default="data/shuffled")
+    ap.add_argument("--data-dir", default="data/packed")
     ap.add_argument("--tokenizer", default="tokenizer")
     ap.add_argument("--split", default="val")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--max-blocks", type=int, default=512)
     ap.add_argument("--plot", default="out/curves.png")
-    ap.add_argument("--autocast", choices=["bf16", "none"], default="bf16",
+    ap.add_argument("--corpus", default="data/tinystories/corpus.txt",
+                    help="text used for the tokenizer-free bits/byte metric")
+    ap.add_argument("--autocast", choices=["bf16", "none"], default="none",
                     help="must match the setting 04_train.py ran with, or the val loss here will "
                          "not reproduce the checkpoint-selection numbers (see 04_train.py)")
     args = ap.parse_args()
@@ -114,7 +116,10 @@ def main() -> None:
     m = metrics(model, data, args.batch_size, dev, args.max_blocks, args.autocast == "bf16")
 
     # tokens-per-byte on the corpus itself, to get a tokenizer-free metric
-    corpus = Path("data/corpus.txt").read_text(encoding="utf-8")[:200_000]
+    corpus_path = Path(args.corpus)
+    if not corpus_path.exists():                       # e.g. the pre-TinyStories corpus
+        corpus_path = Path("data/corpus.txt")
+    corpus = corpus_path.read_text(encoding="utf-8")[:200_000]
     tok_per_byte = len(tok.encode(corpus)) / len(corpus.encode("utf-8"))
     bpb = m["val_loss"] * tok_per_byte / math.log(2)
     print(f"[eval] val loss {m['val_loss']:.4f} | ppl {m['val_ppl']:.2f} | "
