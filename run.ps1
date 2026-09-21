@@ -16,7 +16,8 @@
 .EXAMPLE
   .\run.ps1                                        # default prompt, 150 tokens, temp 0.8
   .\run.ps1 -Prompt "Once upon a time" -N 250
-  .\run.ps1 -Seed 1337                             # reproducible output
+  .\run.ps1 -Interactive                           # prompts without reloading weights
+  .\run.ps1 -Seed 4294967295                       # reproducible output
   .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
 
 .NOTES
@@ -28,11 +29,13 @@ param(
     [string]$Prompt = "It was a dark and stormy night",
     [int]   $N      = 150,        # tokens to generate
     [double]$Temp   = 0.8,
-    [int]   $TopK   = 50,
+    [int]   $TopK   = 40,
     [double]$TopP   = 0.9,
-    [int]   $Seed   = -1,         # -1 = random (the seed used is printed)
+    [long]  $Seed   = -1,         # -1 = random (the seed used is printed)
     [string]$Ckpt   = "out/model_best.pt",
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [double]$RepeatPenalty = 1.15,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,7 +78,8 @@ if (-not (Test-Path -LiteralPath $Ckpt)) {
 # --- 4. generate ------------------------------------------------------------
 Write-Host "[run] generating with $exe  (Ctrl+C stops it)" -ForegroundColor Cyan
 $genArgs = @("generate.py", "--ckpt", $Ckpt, "--prompt", $Prompt, "--n", $N,
-             "--temp", $Temp, "--top-k", $TopK, "--top-p", $TopP)
+             "--temp", $Temp, "--top-k", $TopK, "--top-p", $TopP, "--repeat-penalty", $RepeatPenalty)
+if ($Interactive) { $genArgs += "--interactive" }
 if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
 
 & $exe @genArgs
