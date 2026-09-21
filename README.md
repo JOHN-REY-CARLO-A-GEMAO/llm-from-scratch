@@ -32,7 +32,9 @@ On Windows you can also just double-click **`run.bat`**, or pass arguments:
 ```powershell
 .\run.ps1                                   # "It was a dark and stormy night", 150 tokens, temp 0.8
 .\run.ps1 -Prompt "Once upon a time" -N 250 -Temp 0.9
-.\run.ps1 -Seed 1337                        # reproducible sample
+.\run.ps1 -Seed 4294967295                  # reproducible sample (64-bit seeds supported)
+.\run.ps1 -Interactive                       # keep weights loaded between prompts
+.\run.ps1 -TopK 40 -TopP 0.9 -RepeatPenalty 1.15
 .\run.ps1 -Python C:\Python312\python.exe   # pick a specific interpreter
 ```
 
@@ -43,6 +45,32 @@ present, then calls `generate.py`. `run.bat` is the same thing for cmd/double-cl
 ```bash
 python generate.py --prompt "It was a dark and stormy night" --n 150 --temp 0.8 --seed 1337
 ```
+
+Text streams to the terminal as tokens are generated (including with `--quiet`,
+which prints only prompt + continuation). Byte-level UTF-8 fragments are buffered
+until a complete character is ready, so Unicode doesn't break during streaming.
+
+For a persistent prompt session:
+
+```bash
+python generate.py --interactive --top-k 40 --top-p 0.9 --repeat-penalty 1.15
+```
+
+The model and tokenizer load **once**. Each prompt is an independent continuation,
+not a chat with accumulated history; `--prompt` is ignored in interactive mode.
+Blank input is skipped. Type `/exit` or `/quit` (also `exit` / `quit`), or use EOF
+(Ctrl+D on Unix, Ctrl+Z then Enter on Windows) or Ctrl+C to exit cleanly.
+Ctrl+C during generation also exits the session.
+
+Sampling defaults: **top-k 40**, **top-p 0.9**, **repetition penalty 1.15**.
+Use `--top-k 0`, `--top-p 1`, or `--repeat-penalty 1` to disable each filter;
+`--temp 0` selects greedy decoding (still applying the repetition penalty).
+The penalty lowers the score of each distinct token already in the prompt/output.
+`--repetition-penalty` is an alias for `--repeat-penalty`.
+A fixed `--seed` is reused for each prompt, making repeated prompts reproducible;
+without it each prompt gets a new seed, printed unless `--quiet` is set.
+Generation stops at the trained context limit. Overlong prompts use their last
+255 tokens with the shipped 256-token model; no weights are updated.
 
 `generate.py` is the *inference-only* CLI: its only third-party dependency is
 torch (no numpy, no matplotlib; the tokenizer falls back to stdlib `re`), it runs

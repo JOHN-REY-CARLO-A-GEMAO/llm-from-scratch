@@ -29,6 +29,7 @@ Design notes, each of which is a real inference-time bug it avoids:
 from __future__ import annotations
 
 import argparse
+import codecs
 import os
 import sys
 import time
@@ -105,6 +106,97 @@ def render(tok, ids: list[int]) -> tuple[str, int]:
     return "".join(chunks), n_special
 
 
+class TokenStream:
+    """Render byte-BPE tokens incrementally, buffering only incomplete UTF-8.
+
+    Decoding each token separately would turn split curly quotes/emoji into
+    replacement characters. Finalise at document boundaries just like render().
+    """
+
+    def __init__(self, tok, unicode_to_bytes):
+        self.tok = tok
+        self.to_bytes = unicode_to_bytes
+        self.special = {tok.token_to_id[s] for s in tok.special_tokens}
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.n_special = 0
+
+    def __call__(self, token_id: int) -> None:
+        if token_id in self.special:
+            text = self.decoder.decode(b"", final=True) + "\n\n"
+            self.decoder.reset()
+            self.n_special += 1
+        else:
+            text = self.decoder.decode(self.to_bytes(self.tok.id_to_token[token_id]))
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        sys.stdout.write(self.decoder.decode(b"", final=True))
+        sys.stdout.flush()
+        self.decoder.reset()
+
+
+def run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
+    prompt_ids = tok.encode(prompt) if prompt else []
+    if not prompt_ids:
+        if not tok.special_tokens:
+            die("empty prompt, and this tokenizer has no special start token.")
+        prompt_ids = [tok.token_to_id[tok.special_tokens[0]]]
+
+    seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
+    params = gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
+                                    repeat_penalty=args.repeat_penalty, seed=seed)
+    if not args.quiet:
+        print(f"\n=== prompt ({len(prompt_ids)} tokens) ===\n{prompt}")
+        if len(prompt_ids) >= cfg.block_size:
+            print(f"[gen] using the last {cfg.block_size - 1} prompt tokens to fit context.")
+        print("\n=== continuation ===", flush=True)
+
+    stream = TokenStream(tok, tok_mod.unicode_to_bytes)
+    # Preserve --quiet's full-text output, but never print the result twice.
+    if args.quiet:
+        for token_id in prompt_ids:
+            stream(token_id)
+    t0 = time.perf_counter()
+    try:
+        ids, tok_per_s, _ = gen_mod.generate(
+            model, prompt_ids, args.n, params, use_cache=True, device=device,
+            block_size=cfg.block_size, on_token=stream)
+    finally:
+        stream.finish()
+        print(flush=True)
+    elapsed = time.perf_counter() - t0
+    # Returned ids include the original prompt, even if prefill was truncated.
+    new_tokens = len(ids) - len(prompt_ids)
+    if not args.quiet:
+        print(f"\n[gen] {new_tokens} new tokens, {tok_per_s:,.0f} tok/s (incl. prefill), "
+              f"{elapsed:.2f} s")
+        if new_tokens < args.n:
+            print(f"[gen] stopped after {new_tokens} of {args.n} tokens: hit the "
+                  f"{cfg.block_size}-token context window. Shorten --prompt or --n.")
+        if stream.n_special:
+            print(f"[gen] the model emitted {stream.n_special} document separator token(s) "
+                  f"(<|doc_end|>), shown as a blank line.")
+        print(f"[gen] seed {seed}  (re-run with --seed {seed} to reproduce this text)")
+
+
+def repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
+    if not args.quiet:
+        print("[gen] Interactive mode: each prompt starts a fresh continuation (no chat history).")
+        print("[gen] Type /exit or /quit to leave; EOF or Ctrl+C also exits. Blank input is skipped.")
+    while True:
+        try:
+            prompt = input("\nYou> " if not args.quiet else "")
+            if prompt.strip().lower() in {"/exit", "/quit", "exit", "quit"}:
+                break
+            if not prompt.strip():
+                continue
+            run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="generate.py",
@@ -119,20 +211,29 @@ def main() -> None:
                     help="number of new tokens to sample")
     ap.add_argument("--temp", "--temperature", dest="temp", type=float, default=0.8,
                     help="0 = greedy; 0.7-0.9 reads as prose for this model size")
-    ap.add_argument("--top-k", type=int, default=50, help="0 disables the top-k cap")
+    ap.add_argument("--top-k", type=int, default=40, help="0 disables the top-k cap")
     ap.add_argument("--top-p", type=float, default=0.9, help="nucleus sampling; 1.0 disables")
-    ap.add_argument("--repeat-penalty", type=float, default=1.05,
+    ap.add_argument("--repeat-penalty", "--repetition-penalty", type=float, default=1.15,
                     help="1.0 disables; small models loop without it")
     ap.add_argument("--seed", type=int, default=None,
                     help="default: a random seed, which is printed so the run can be repeated")
     ap.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     ap.add_argument("--quiet", action="store_true", help="print the generated text only")
+    ap.add_argument("--interactive", action="store_true",
+                    help="read prompts in a REPL without reloading weights; ignores --prompt")
     args = ap.parse_args()
+    if args.n < 0:
+        ap.error("--n must be >= 0")
 
     torch = import_torch()
     from _stage import load as _load          # noqa: E402  (needs torch already importable)
     model_mod, gen_mod = _load("03_model"), _load("06_generate")
     tok_mod = _load("01_tokenizer")
+    try:
+        gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
+                               repeat_penalty=args.repeat_penalty, seed=args.seed)
+    except ValueError as e:
+        ap.error(str(e))
 
     args.threads = args.threads if args.threads > 0 else (os.cpu_count() or 1)
     torch.set_num_threads(args.threads)
@@ -162,16 +263,6 @@ def main() -> None:
         p.requires_grad_(False)
     tok = tok_mod.ByteLevelBPE.load(tok_dir)
 
-    prompt_ids = tok.encode(args.prompt) if args.prompt else []
-    if not prompt_ids:                        # empty prompt: start a new document
-        if not tok.special_tokens:
-            die("empty prompt, and this tokenizer has no special start token.")
-        prompt_ids = [tok.token_to_id[tok.special_tokens[0]]]
-
-    seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
-    params = gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
-                                    repeat_penalty=args.repeat_penalty, seed=seed)
-
     if not args.quiet:
         print(f"[gen] torch {torch.__version__}  device cpu  threads {args.threads}")
         print(f"[gen] checkpoint {ckpt}  ({model.num_params():,} params, "
@@ -183,28 +274,13 @@ def main() -> None:
             print("[gen] note: `regex` is not installed, so the stdlib word-splitting pattern is "
                   "used (pip install regex for byte-identical prompt tokenisation).")
 
-    t0 = time.perf_counter()
-    ids, tok_per_s, n_total = gen_mod.generate(
-        model, prompt_ids, args.n, params, use_cache=True, device=dev, block_size=cfg.block_size)
-    elapsed = time.perf_counter() - t0
-    text, n_doc_end = render(tok, ids)
-    new_tokens = n_total - len(prompt_ids)
-
-    if not args.quiet:
-        print(f"\n=== prompt ({len(prompt_ids)} tokens) ===\n{args.prompt}")
-        print(f"\n=== continuation ({new_tokens} new tokens, {tok_per_s:,.0f} tok/s, "
-              f"{elapsed:.2f} s) ===")
-    print(text)
-    if not args.quiet:
-        if new_tokens < args.n:
-            why = (f"hit the {cfg.block_size}-token context window" if not n_doc_end
-                   else "that is all this checkpoint can be pushed to")
-            print(f"\n[gen] stopped after {new_tokens} of {args.n} tokens: {why}. "
-                  f"Shorter --prompt or smaller --n fits more.")
-        if n_doc_end:
-            print(f"[gen] the model emitted {n_doc_end} document separator token(s) "
-                  f"(<|doc_end|>), shown as a blank line.")
-        print(f"[gen] seed {seed}  (re-run with --seed {seed} to reproduce this text)")
+    if args.interactive:
+        repl(args, model, cfg, tok, tok_mod, gen_mod, dev)
+    else:
+        try:
+            run_prompt(args.prompt, args, model, cfg, tok, tok_mod, gen_mod, dev)
+        except KeyboardInterrupt:
+            raise SystemExit(130)
 
 
 if __name__ == "__main__":
