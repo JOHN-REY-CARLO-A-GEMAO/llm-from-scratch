@@ -85,7 +85,9 @@ def find_config(ckpt: Path, explicit: str | None) -> Path:
         if not p.exists():
             die(f"--config {p} does not exist.")
         return p
-    for name in ("config.json", "config.txt"):
+    # Fine-tuned variants can share a directory with the base checkpoint while
+    # using an expanded vocabulary, so prefer a checkpoint-specific config.
+    for name in (ckpt.stem + "_config.json", "config.json", "config.txt"):
         p = ckpt.parent / name
         if p.exists():
             return p
@@ -187,6 +189,84 @@ def run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
         print(f"[gen] seed {seed}  (re-run with --seed {seed} to reproduce this text)")
 
 
+def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
+    """Conversational REPL using the same serialization as SFT.
+
+    Complete user/assistant turns are retained until the context fills. Older
+    turns are removed as units, rather than slicing through a role marker.
+    """
+    im_start, im_end = "<|im_start|>", "<|im_end|>"
+    try:
+        end_id = tok.token_to_id[im_end]
+        tok.token_to_id[im_start]
+    except KeyError:
+        die("chat tokenizer is missing <|im_start|>/<|im_end|>. "
+            "Run 08_sft.py or pass --tokenizer tokenizer/chat.")
+    specials = [im_start, im_end]
+    history: list[tuple[str, str]] = []
+    if not args.quiet:
+        print("[chat] Multi-turn chat mode. Type /exit or /quit to leave; /clear resets history.")
+
+    while True:
+        try:
+            user = input("\nYou> " if not args.quiet else "")
+            command = user.strip().lower()
+            if command in {"/exit", "/quit", "exit", "quit"}:
+                break
+            if command == "/clear":
+                history.clear()
+                if not args.quiet:
+                    print("[chat] History cleared.")
+                continue
+            if not user.strip():
+                continue
+
+            def serialize(turns):
+                done = [f"{im_start}user\n{u}{im_end}\n{im_start}assistant\n{a}{im_end}"
+                        for u, a in turns]
+                current = f"{im_start}user\n{user}{im_end}\n{im_start}assistant\n"
+                return "\n".join(done + [current])
+
+            prompt = serialize(history)
+            prompt_ids = tok.encode_with_specials(prompt, specials)
+            # Leave useful room for an answer and discard oldest complete turns.
+            reserve = min(args.n, max(32, cfg.block_size // 3))
+            while history and len(prompt_ids) > cfg.block_size - reserve:
+                history.pop(0)
+                prompt = serialize(history)
+                prompt_ids = tok.encode_with_specials(prompt, specials)
+
+            seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
+            params = gen_mod.SamplingParams(temperature=args.temp, top_k=args.top_k,
+                                            top_p=args.top_p,
+                                            repeat_penalty=args.repeat_penalty, seed=seed)
+            stream = TokenStream(tok, tok_mod.unicode_to_bytes)
+            if not args.quiet:
+                print("Assistant> ", end="", flush=True)
+
+            # generate() reports EOS to callbacks by contract. Hide the marker
+            # from the terminal while retaining it in ids for exact stopping.
+            def emit(token_id):
+                if token_id != end_id:
+                    stream(token_id)
+
+            try:
+                ids, _, _ = gen_mod.generate(
+                    model, prompt_ids, args.n, params, use_cache=True, eos_id=end_id,
+                    device=device, block_size=cfg.block_size, on_token=emit)
+            finally:
+                stream.finish()
+                print(flush=True)
+            generated = ids[len(prompt_ids):]
+            if generated and generated[-1] == end_id:
+                generated = generated[:-1]
+            answer = tok.decode(generated).strip()
+            history.append((user, answer))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+
 def repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
     if not args.quiet:
         print("[gen] Interactive mode: each prompt starts a fresh continuation (no chat history).")
@@ -209,9 +289,11 @@ def main() -> None:
         prog="generate.py",
         description="Generate text from a trained checkpoint on the CPU.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--ckpt", default="out/model_best.pt", help="checkpoint (.pt) to load")
-    ap.add_argument("--config", default=None, help="default: config.json/config.txt next to --ckpt")
-    ap.add_argument("--tokenizer", default="tokenizer", help="directory holding bpe.pkl")
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint (.pt); defaults to model_chat.pt in --chat, else model_best.pt")
+    ap.add_argument("--config", default=None, help="default: checkpoint-specific config, then config.json/config.txt")
+    ap.add_argument("--tokenizer", default=None,
+                    help="tokenizer directory; defaults to tokenizer/chat in --chat, else tokenizer")
     ap.add_argument("--prompt", default="Once upon a time, there was a little girl named Lily",
                     help="text to continue; '' starts from the model's document token")
     ap.add_argument("-n", "--n", "--tokens", dest="n", type=int, default=150,
@@ -228,7 +310,15 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true", help="print the generated text only")
     ap.add_argument("--interactive", action="store_true",
                     help="read prompts in a REPL without reloading weights; ignores --prompt")
+    ap.add_argument("--chat", action="store_true",
+                    help="instruction-tuned multi-turn chat REPL (implies --interactive)")
     args = ap.parse_args()
+    if args.chat:
+        args.interactive = True
+    if args.ckpt is None:
+        args.ckpt = "out/model_chat.pt" if args.chat else "out/model_best.pt"
+    if args.tokenizer is None:
+        args.tokenizer = "tokenizer/chat" if args.chat else "tokenizer"
     if args.n < 0:
         ap.error("--n must be >= 0")
 
@@ -283,7 +373,9 @@ def main() -> None:
             print("[gen] note: `regex` is not installed, so the stdlib word-splitting pattern is "
                   "used (pip install regex for byte-identical prompt tokenisation).")
 
-    if args.interactive:
+    if args.chat:
+        chat_repl(args, model, cfg, tok, tok_mod, gen_mod, dev)
+    elif args.interactive:
         repl(args, model, cfg, tok, tok_mod, gen_mod, dev)
     else:
         try:
