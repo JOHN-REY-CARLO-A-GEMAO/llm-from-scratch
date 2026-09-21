@@ -11,6 +11,7 @@ echo "== 06 generation: sampler properties, cached==uncached ==";           pyth
 echo "== CPU inference: streaming, sampling, REPL, CLI ==";                 python3 tests/test_inference.py 2>&1 | tail -3
 echo "== SFT: chat tokens, response masking, dataset/checkpoint ==";          python3 tests/test_sft.py 2>&1 | tail -3
 echo "== INT8 quantisation: per-channel scales, save/load, KV cache ==";      python3 tests/test_quantize.py 2>&1 | tail -3
-echo "== tools/personas: safe calculator, math detection, system prompts =="; python3 tests/test_tools.py 2>&1 | tail -3
-echo "== web UI: stream decoder, chat engine, personas, HTTP end-to-end ==";  python3 tests/test_web_ui.py 2>&1 | tail -3
+echo "== tools/personas: python tool, date/time, markers, CoT parsing ==";   python3 tests/test_tools.py 2>&1 | tail -3
+echo "== rag: chunking, BM25 retrieval, context block, grounding ==";        python3 tests/test_rag.py 2>&1 | tail -3
+echo "== web UI: stream decoder, chat engine, RAG, CoT, HTTP end-to-end ==";  python3 tests/test_web_ui.py 2>&1 | tail -3
 echo "ALL TESTS PASSED"

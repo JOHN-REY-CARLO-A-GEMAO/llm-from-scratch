@@ -1,11 +1,11 @@
 {
   "data": "data/sft/chat_sft.jsonl",
-  "model": "out15m/model_15m_best.pt",
-  "config": "out15m/model_15m_best_config.json",
+  "model": "out/model_15m_best.pt",
+  "config": "out/model_15m_best_config.json",
   "tokenizer": "tokenizer",
   "chat_tokenizer": "tokenizer/chat",
   "out": "out/model_15m_chat.pt",
-  "iters": 400,
+  "iters": 600,
   "batch_size": 16,
   "lr": 0.0001,
   "min_lr_frac": 0.1,
@@ -15,7 +15,126 @@
   "val_examples": 256,
   "seed": 2026,
   "autocast": "none",
+  "cot_pins": 96,
+  "cot_check": [
+    {
+      "prompt": "Why does it rain?",
+      "reply": "<think>\n1. Step one: read the question: why does it rain.\n2. Step two: gather the facts: water warms, rises into the sky, and cools into tiny drops in clouds.\n3. Step three: answer and answer in one or two short sentences.\n</think>\nWater warms, rises into the sky, and cools into tiny drops in clouds. When the drops grow heavy, they fall as rain.",
+      "system": "\ud83e\udde0 Reasoner",
+      "reasoning": "1. Step one: read the question: why does it rain.\n2. Step two: gather the facts: water warms, rises into the sky, and cools into tiny drops in clouds.\n3. Step three: answer and answer in one or two short sentences.",
+      "answer": "Water warms, rises into the sky, and cools into tiny drops in clouds. When the drops grow heavy, they fall as rain.",
+      "closed": true,
+      "reasoning_chars": 214
+    },
+    {
+      "prompt": "Sam has 12 marbles, gets 4 more, and gives 6 away. How many marbles does Sam have?",
+      "reply": "<think>\n1. Sam starts with 12 marbles.\n2. Sam gets 4 more: 12 + 4 = 20.\n3. Sam gives 2 away: 22 - 2 = 22.\n</think>\nSam has 21 marbles now.",
+      "system": "\ud83e\udde0 Reasoner",
+      "reasoning": "1. Sam starts with 12 marbles.\n2. Sam gets 4 more: 12 + 4 = 20.\n3. Sam gives 2 away: 22 - 2 = 22.",
+      "answer": "Sam has 21 marbles now.",
+      "closed": true,
+      "reasoning_chars": 97
+    },
+    {
+      "prompt": "Is 7 + 5 bigger than 45?",
+      "reply": "<think>\n1. Work out the sum first: 15 + 4 = 20.\n2. Now compare 20 with 20.\n3. 20 is smaller than 20.\n</think>\nNo. 15 + 4 = 20, and 20 is smaller than 22.",
+      "system": "\ud83e\udde0 Reasoner",
+      "reasoning": "1. Work out the sum first: 15 + 4 = 20.\n2. Now compare 20 with 20.\n3. 20 is smaller than 20.",
+      "answer": "No. 15 + 4 = 20, and 20 is smaller than 22.",
+      "closed": true,
+      "reasoning_chars": 92
+    }
+  ],
+  "doc_check": {
+    "series": [
+      {
+        "series": "trained shapes",
+        "entity": "wobbin",
+        "passage": "The wobbin lives in the salt flats of Grim. The wobbin eats amber seeds. The wobbin makes a low wooden knock.",
+        "rows": [
+          {
+            "question": "Where does the wobbin live?",
+            "reply": "The document does not say.",
+            "expected": "the salt flats of Grim",
+            "retrieved": 1,
+            "grounding": 0.0,
+            "copied": false
+          },
+          {
+            "question": "What does the wobbin eat?",
+            "reply": "The document does not say.",
+            "expected": "amber seeds",
+            "retrieved": 1,
+            "grounding": 0.0,
+            "copied": false
+          },
+          {
+            "question": "What sound does the wobbin make?",
+            "reply": "The verdin makes a quick tapping beat.",
+            "expected": "a low wooden knock",
+            "retrieved": 1,
+            "grounding": 0.2,
+            "copied": false
+          },
+          {
+            "question": "What colour is the wobbin?",
+            "reply": "The document does not say.",
+            "expected": "(refusal)",
+            "retrieved": 1,
+            "grounding": null,
+            "copied": true
+          }
+        ],
+        "copied": 1,
+        "asked": 4
+      },
+      {
+        "series": "unseen shapes",
+        "entity": "gorlin",
+        "passage": "You can find the gorlin in the cold spring of Havn. The gorlin feeds on bitter cloudberries. The gorlin calls out with a single ringing note.",
+        "rows": [
+          {
+            "question": "Where can I find the gorlin?",
+            "reply": "<think>\n1. Find the sentence about the gorilla in the context.\n2. Copy that sentence out exactly as it is written.\n</think>\nThe gorilla lives in the",
+            "expected": "the cold spring of Havn",
+            "retrieved": 1,
+            "grounding": null,
+            "copied": false
+          },
+          {
+            "question": "What is the food of the gorlin?",
+            "reply": "<think>\n1. Find the sentence about the gorilla in the context.\n2. Copy that sentence out exactly as it is written.\n</think>\nThe gorilla eats sweet ne",
+            "expected": "bitter cloudberries",
+            "retrieved": 1,
+            "grounding": 0.0,
+            "copied": false
+          },
+          {
+            "question": "What noise does the gorlin make?",
+            "reply": "<think>\n1. Find the sentence about the gorilla in the context.\n2. Copy that sentence out exactly as it is written.\n</think>\nThe gorilla makes a quick ta",
+            "expected": "a single ringing note",
+            "retrieved": 1,
+            "grounding": 0.0,
+            "copied": false
+          },
+          {
+            "question": "What colour is the gorlin?",
+            "reply": "The document does not say.",
+            "expected": "(refusal)",
+            "retrieved": 1,
+            "grounding": null,
+            "copied": true
+          }
+        ],
+        "copied": 1,
+        "asked": 4
+      }
+    ],
+    "copied": 2,
+    "asked": 8
+  },
+  "doc_pins": 64,
   "vocab_size": 4098,
-  "best_val_loss": 0.11158540642926627,
-  "seconds": 239.215970993042
+  "best_val_loss": 0.10632351323988695,
+  "seconds": 703.2023637294769
 }

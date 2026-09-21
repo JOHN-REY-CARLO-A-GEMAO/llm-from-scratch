@@ -34,10 +34,13 @@ Design notes, each of which is a real inference-time bug it avoids:
    some environments, which quietly makes CPU generation several times slower.
 
 Chat mode additionally supports a **system prompt** (`--persona`, `--system`,
-and `/persona` / `/system` inside the REPL) and a **calculator hook**
-(`--no-tools` disables it). Both are shared with `web_ui.py` — `personas.py`
-builds the `<|im_start|>system` block and `tools.py` evaluates arithmetic — so
-the terminal and the browser send byte-identical prompts.
+and `/persona` / `/system` inside the REPL), the **tool hooks** (`tools.py`:
+calculator, python tool, date/time; `--no-tools` disables them), a **reasoning
+view** (`<think> … </think>` blocks are printed as their own labelled section)
+and **document Q&A** (`--doc notes.md`, via `rag.py`). All of it is shared with
+`web_ui.py` — `personas.py` owns both halves of the chat protocol, `tools.py`
+evaluates, `rag.py` retrieves — so the terminal and the browser send
+byte-identical prompts.
 """
 from __future__ import annotations
 
@@ -53,6 +56,7 @@ if str(HERE) not in sys.path:            # the stage files are importable by nam
     sys.path.insert(0, str(HERE))
 
 import personas                          # noqa: E402  (stdlib-only, torch-free)
+import rag                               # noqa: E402
 import tools                             # noqa: E402
 
 IM_START, IM_END = personas.IM_START, personas.IM_END
@@ -135,20 +139,27 @@ class TokenStream:
     `tool_filter` (optional) rewrites the text on its way out, which is where a
     model-emitted `<<calc: 5 + 5>>` becomes `10`. Everything written is also
     collected in `written`, so the caller can keep exactly what the user saw as
-    the assistant turn for the next round.
+    the assistant turn for the next round. `display` (optional) takes over
+    printing only — the chat REPL uses it to render a `<think>` block as a
+    labelled reasoning section while `written` stays the raw reply, markers and
+    all, which is what the next turn's prompt needs.
     """
 
-    def __init__(self, tok, unicode_to_bytes, tool_filter=None):
+    def __init__(self, tok, unicode_to_bytes, tool_filter=None, display=None):
         self.tok = tok
         self.to_bytes = unicode_to_bytes
         self.special = {tok.token_to_id[s] for s in tok.special_tokens}
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.n_special = 0
         self.tool_filter = tool_filter
+        self.display = display
         self.written: list[str] = []
 
     def _emit(self, text: str) -> None:
         self.written.append(text)
+        if self.display is not None:
+            self.display(text)
+            return
         sys.stdout.write(text)
         sys.stdout.flush()
 
@@ -247,6 +258,76 @@ def initial_system(args) -> tuple[str, str]:
     return personas.resolve(value, tool_hint=not getattr(args, "no_tools", False))
 
 
+class ReasoningPrinter:
+    """Print a streamed reply with its `<think>` trace in its own labelled block.
+
+    The split is `personas.ThinkStreamFilter`, the same one the browser's
+    `splitThink` mirrors, so the terminal shows the same two parts. No ANSI: a
+    Windows console that drops escape codes would print `[2m` in the middle of a
+    sentence, and a prefix costs nothing.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.filter = personas.ThinkStreamFilter()
+        self.in_reasoning = False
+        self.in_answer = False
+
+    def write(self, kind: str, chunk: str) -> None:
+        if not chunk:
+            return
+        if self.enabled and kind == "reasoning" and not self.in_reasoning:
+            self.in_reasoning = True
+            sys.stdout.write("\n🧠 reasoning> ")
+        elif self.enabled and kind == "answer" and not self.in_answer:
+            self.in_answer = True
+            sys.stdout.write("\nAssistant> " if self.in_reasoning or self.in_answer else "")
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+    def __call__(self, text: str) -> None:
+        for kind, chunk in self.filter.feed(text):
+            self.write(kind, chunk)
+
+    def finish(self) -> None:
+        for kind, chunk in self.filter.finish():
+            self.write(kind, chunk)
+        sys.stdout.flush()
+
+
+def load_document(path, args) -> "object | None":
+    """Index `--doc FILE` for chat mode, with the same limits as the web UI."""
+    if not path:
+        return None
+    target = resolve(Path(path))
+    if not target.exists():
+        die(f"--doc {target} does not exist.")
+    try:
+        index = rag.DocumentIndex.from_text(target.read_text(encoding="utf-8", errors="replace"),
+                                           name=target.name)
+    except (OSError, ValueError) as e:
+        die(f"--doc {target}: {e}")
+    if not args.quiet:
+        stats = index.stats()
+        print(f"[chat] document '{stats['name']}': {stats['chunks']} chunks, "
+              f"{stats['chars']:,} chars, {stats['terms']:,} terms")
+    return index
+
+
+def document_system(index, question: str, system: str, cfg, tok, specials, args) -> tuple[str, list]:
+    """`(system prompt with the retrieved context, hits)` — the same block the
+    browser builds, sized with the same rule (`reserve = min(n, ctx // 3)`)."""
+    if index is None:
+        return system, []
+    reserve = min(args.n, max(32, cfg.block_size // 3))
+    cost = lambda text: len(tok.encode_with_specials(  # noqa: E731
+        serialize_chat(text, [], question), specials))
+    block, hits = index.context_block(question, cfg.block_size - reserve, cost, top_k=2)
+    if not block:
+        return system, hits
+    return block + (f"\n\n{system}" if system else ""), hits
+
+
 def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
     """Conversational REPL using the same serialization as SFT.
 
@@ -268,6 +349,7 @@ def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
     specials = [IM_START, IM_END]
     tools_on = not getattr(args, "no_tools", False)
     label, system = initial_system(args)
+    index = load_document(getattr(args, "doc", None), args)
     history: list[tuple[str, str]] = []
     if not args.quiet:
         print("[chat] Multi-turn chat mode. Type /exit or /quit to leave; /clear resets history.")
@@ -317,37 +399,44 @@ def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
             if not user.strip():
                 continue
 
-            # ---- tool hook: a bare arithmetic question never reaches the model.
-            # A math question inside prose is still answered by the model (it can
-            # be part of a bigger question) — the exact value is appended after.
-            query = tools.find_math_question(user) if tools_on else None
+            # ---- tool hook: anything a tool answers exactly never reaches the
+            # model (arithmetic, word counts, reversals, dates). A maths question
+            # inside prose is still answered by the model — it may be part of a
+            # bigger question — and the exact value is appended afterwards.
+            query = tools.find_tool_question(user) if tools_on else None
             if query is not None and query.bare:
                 answer = query.answer         # "5 + 5 = 10", computed exactly
                 if not args.quiet:
-                    print(f"[calc] {query.expression!r} -> {answer} (computed locally; "
-                          f"the model was not asked)")
+                    tag = "calc" if query.kind == "math" else query.source
+                    print(f"[{tag}] {query.expression!r} -> {query.result.text} "
+                          f"(computed locally; the model was not asked)")
                     print("Assistant> " + answer, flush=True)
                 else:
                     print(answer, flush=True)
                 history.append((user, answer))
                 continue
 
-            prompt_ids = encode(system, history)
+
+            prompt_system, hits = document_system(index, user, system, cfg, tok, specials, args)
+            if hits and not args.quiet:
+                print(f"[rag] using {len(hits)} passage(s) from {index.name}: "
+                      + ", ".join(f"#{hit.index} ({hit.relevance:.2f})" for hit in hits))
+            prompt_ids = encode(prompt_system, history)
             # Leave useful room for an answer and discard oldest complete turns.
             reserve = min(args.n, max(32, cfg.block_size // 3))
             while history and len(prompt_ids) > cfg.block_size - reserve:
                 history.pop(0)
-                prompt_ids = encode(system, history)
-            if system and len(prompt_ids) > cfg.block_size - reserve:
+                prompt_ids = encode(prompt_system, history)
+            if prompt_system and len(prompt_ids) > cfg.block_size - reserve:
                 # Even an empty history does not fit: shrink the system block
                 # rather than let prefill silently drop it (and the question).
-                system = personas.shrink(
-                    system, lambda text: len(encode(text, history)),
+                prompt_system = personas.shrink(
+                    prompt_system, lambda text: len(encode(text, history)),
                     cfg.block_size - reserve)
-                prompt_ids = encode(system, history)
+                prompt_ids = encode(prompt_system, history)
                 if not args.quiet:
                     print(f"[chat] system prompt trimmed to "
-                          f"{len(tok.encode_with_specials(system, specials))} tokens "
+                          f"{len(tok.encode_with_specials(prompt_system, specials))} tokens "
                           f"to fit the {cfg.block_size}-token context.")
 
             seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
@@ -355,7 +444,9 @@ def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
                                             top_p=args.top_p,
                                             repeat_penalty=args.repeat_penalty, seed=seed)
             tool_filter = tools.ToolTextFilter() if tools_on else None
-            stream = TokenStream(tok, tok_mod.unicode_to_bytes, tool_filter)
+            printer = ReasoningPrinter(enabled=True)
+            stream = TokenStream(tok, tok_mod.unicode_to_bytes, tool_filter,
+                                 display=printer if not args.quiet else None)
             if not args.quiet:
                 print("Assistant> ", end="", flush=True)
 
@@ -373,14 +464,15 @@ def chat_repl(args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
                     device=device, block_size=cfg.block_size, on_token=emit)
             finally:
                 stream.finish()
+                printer.finish()
                 print(flush=True)
             if tool_filter is not None and tool_filter.calls:
                 if not args.quiet:
-                    print("[calc] substituted " + ", ".join(c.line for c in tool_filter.calls)
-                          + " into the reply")
+                    print("[tool] substituted "
+                          + ", ".join(c.line for c in tool_filter.calls) + " into the reply")
             # The assistant turn is what the user saw, tool results included.
             answer = "".join(stream.written).strip()
-            if query is not None and not tools.value_in_text(query.calculation, answer):
+            if query is not None and not tools.value_in_text(query.result, answer):
                 # The model answered a math question with a number of its own
                 # invention: the exact value goes with it, every time, so the
                 # user is never left with only the guess.
@@ -437,6 +529,9 @@ def main() -> None:
                     help="default: a random seed, which is printed so the run can be repeated")
     ap.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     ap.add_argument("--quiet", action="store_true", help="print the generated text only")
+    ap.add_argument("--doc", default=None, metavar="FILE",
+                    help="chat mode: index a .txt/.md file and answer from it (rag.py), "
+                         "reporting which passages were used")
     ap.add_argument("--interactive", action="store_true",
                     help="read prompts in a REPL without reloading weights; ignores --prompt")
     ap.add_argument("--chat", action="store_true",

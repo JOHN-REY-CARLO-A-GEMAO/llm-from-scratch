@@ -1,6 +1,7 @@
 """Web UI tests: stream decoder, chat serialization, system prompts, the
-calculator hook, prompt trimming, engine streaming/cancellation, and the
-stdlib HTTP server end-to-end.
+calculator/python/date tool hooks, <think> rendering, document upload and
+retrieval, prompt trimming, engine streaming/cancellation, and the stdlib HTTP
+server end-to-end.
 
 Loads the real committed checkpoint (auto-prefers out/model_15m_chat(_int8).pt,
 falls back to out/model_chat.pt, ~8 MB) like every other test in this repo; a
@@ -43,7 +44,6 @@ def _resolve_chat_ckpt():
         ("out/model_chat_int8.pt",     "out/model_chat_config.json"),
         ("out/model_chat.pt",          "out/model_chat_config.json"),
     ]
-    import quantize  # noqa: E402
     for ckpt_name, cfg_name in candidates:
         ckpt = ROOT / ckpt_name
         cfg_p = ROOT / cfg_name
@@ -52,11 +52,12 @@ def _resolve_chat_ckpt():
     raise FileNotFoundError("no chat checkpoint found")
 
 
-def make_engine(seed=None, persona=None, system=None, no_tools=False):
+def make_engine(seed=None, persona=None, system=None, no_tools=False, no_rag=False,
+                doc=None):
     args = types.SimpleNamespace(temp=0.8, top_p=0.9, top_k=40, repeat_penalty=1.15,
                                  seed=seed, n=24, host="127.0.0.1", port=0,
                                  no_browser=True, persona=persona, system=system,
-                                 no_tools=no_tools)
+                                 no_tools=no_tools, no_rag=no_rag, doc=doc)
     ckpt_p, cfg_p = _resolve_chat_ckpt()
     import quantize  # noqa: E402
     # Try INT8 first
@@ -264,6 +265,158 @@ class EngineTests(unittest.TestCase):
         streamed = "".join(d for k, d in events if k == "token")
         self.assertEqual(streamed, "the sum is 10")
 
+    # ------------------------------------------------- documents (RAG) + CoT
+    DOC = (
+        "The zorble is a small animal. The zorble lives in the warm shallows of "
+        "the Cora River, where it eats small silver fish. When it is happy the "
+        "zorble makes a low humming whistle.\n\n"
+        "The marlow lives in the tall grass of the Plain of Tesh and eats bright "
+        "red berries. It makes a soft fluting song at dawn."
+    )
+
+    def test_a_document_is_indexed_reported_and_cleared(self):
+        engine = make_engine()
+        self.assertIsNone(engine.doc_info())
+        stats = engine.set_document("notes.txt", self.DOC)
+        self.assertEqual(stats["name"], "notes.txt")
+        self.assertGreaterEqual(stats["chunks"], 1)
+        self.assertGreater(stats["terms"], 10)
+        self.assertEqual(engine.doc_info()["chunks"], stats["chunks"])
+        self.assertTrue(engine.info()["doc"]["name"] == "notes.txt")
+        self.assertTrue(engine.info()["rag"])
+        self.assertTrue(engine.clear_document())
+        self.assertFalse(engine.clear_document())
+        self.assertIsNone(engine.doc_info())
+        with self.assertRaises(ValueError):                  # empty is refused
+            engine.set_document("empty.txt", "   \n  ")
+        # a disabled engine refuses to index at all (it never reaches the UI)
+        quiet = make_engine(no_rag=True)
+        self.assertFalse(quiet.info()["rag"])
+        self.assertEqual(quiet.doc_info(), None)
+
+    def test_the_document_block_is_injected_with_the_exact_template(self):
+        engine = make_engine()
+        engine.set_document("notes.txt", self.DOC)
+        events = list(engine.stream_chat("Where does the zorble live?", [], 0.0, 0.9))
+        kinds = [k for k, _ in events]
+        self.assertIn("docs", kinds)
+        self.assertLess(kinds.index("docs"), kinds.index("done"))
+        docs = dict(events[kinds.index("docs")][1])
+        self.assertEqual(docs["doc"]["name"], "notes.txt")
+        self.assertGreaterEqual(len(docs["hits"]), 1)
+        self.assertIn("Cora River", docs["hits"][0]["excerpt"])
+        done = dict(events[-1][1])
+        self.assertTrue(done["system"].startswith("Context from uploaded document:"))
+        self.assertIn("Cora River", done["system"])
+        self.assertIn("\n\nAnswer the user's question based ONLY on this context.",
+                      done["system"] + "\n\nAnswer the user's question based ONLY on "
+                      "this context.")
+        self.assertEqual([h["index"] for h in done["retrieved"]], [h["index"] for h in docs["hits"]])
+        self.assertLessEqual(done["prompt_tokens"], engine.cfg.block_size - 24)
+        self.assertEqual(done["doc"]["chars"], len(self.DOC))
+
+    def test_an_unrelated_question_retrieves_nothing_and_gets_no_context(self):
+        engine = make_engine()
+        engine.set_document("notes.txt", self.DOC)
+        events = list(engine.stream_chat("How do I bake sourdough bread?", [], 0.0, 0.9))
+        self.assertNotIn("docs", [k for k, _ in events])
+        done = dict(events[-1][1])
+        self.assertEqual(done["retrieved"], [])
+        self.assertNotIn("Context from uploaded document:", done["system"])
+        self.assertIsNone(done["grounding"])
+
+    def test_reasoning_is_reported_separately_from_the_answer(self):
+        engine = make_engine(seed=3)
+        marker = ("<think>\n1. Identify the core question: the sum of 5 and 5.\n"
+                  "2. Check the key facts: 5 + 5 = 10.\n</think>\nThe sum is 10.")
+        ids = engine.tok.encode_with_specials(marker, [web_ui.IM_START, web_ui.IM_END])
+        end_id = engine.end_id
+
+        def fake_generate(model, prompt_ids, max_new, params, **kw):
+            for token_id in ids:
+                kw["on_token"](token_id)
+            return list(prompt_ids) + ids + [end_id], 1.0, len(ids)
+
+        engine.gen.generate = fake_generate
+        events = list(engine.stream_chat("add 5 and 5", [], 0.0, 0.9))
+        done = dict(events[-1][1])
+        self.assertTrue(done["think"]["has_reasoning"])
+        self.assertTrue(done["think"]["closed"])
+        self.assertIn("5 + 5 = 10", done["think"]["reasoning"])
+        self.assertEqual(done["think"]["answer"], "The sum is 10.")
+        self.assertEqual(done["reply"], marker)
+        # the wire keeps the markers: the browser needs them to build the card
+        streamed = "".join(d for k, d in events if k == "token")
+        self.assertEqual(streamed, marker)
+
+    def test_an_unclosed_reasoning_block_is_reported_as_unclosed(self):
+        engine = make_engine(seed=3)
+        cut = "<think>\n1. Identify the core question: why it rains."
+        ids = engine.tok.encode_with_specials(cut, [web_ui.IM_START, web_ui.IM_END])
+
+        def fake_generate(model, prompt_ids, max_new, params, **kw):
+            for token_id in ids:
+                kw["on_token"](token_id)
+            return list(prompt_ids) + ids, 1.0, len(ids)
+
+        engine.gen.generate = fake_generate
+        done = dict(list(engine.stream_chat("why does it rain", [], 0.0, 0.9))[-1][1])
+        self.assertTrue(done["think"]["has_reasoning"])
+        self.assertFalse(done["think"]["closed"])          # cut off, not guessed
+        self.assertEqual(done["think"]["answer"], "")
+
+    def test_a_python_tool_marker_in_a_reply_is_executed_and_reported(self):
+        engine = make_engine(seed=3)
+        marker = "count: <<tool: word_count('one two three')>> and reversed <<py: reverse('abc')>>"
+        ids = engine.tok.encode_with_specials(marker, [web_ui.IM_START, web_ui.IM_END])
+
+        def fake_generate(model, prompt_ids, max_new, params, **kw):
+            for token_id in ids:
+                kw["on_token"](token_id)
+            return list(prompt_ids) + ids + [engine.end_id], 1.0, len(ids)
+
+        engine.gen.generate = fake_generate
+        # the *message* is deliberately tool-neutral: a question the detector
+        # recognises is answered locally and never reaches the model
+        events = list(engine.stream_chat("Show me what the tools can do.", [], 0.0, 0.9))
+        done = dict(events[-1][1])
+        self.assertEqual(done["reply"], "count: 3 and reversed 'cba'")
+        self.assertEqual(done["tool_calls"],
+                         ["word_count('one two three') = 3", "reverse('abc') = 'cba'"])
+        tool = [d for k, d in events if k == "tool"][-1]
+        self.assertEqual(tool["kind"], "python")
+        self.assertEqual([r["result"] for r in tool["results"]], ["3", "'cba'"])
+
+    def test_a_word_count_question_is_answered_without_the_model(self):
+        events = list(self.engine.stream_chat("How many words are in 'one two three'?",
+                                              [], 0.0, 0.9))
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds, ["tool", "token", "done"])
+        tool = dict(events[0][1])
+        self.assertEqual(tool["kind"], "string")
+        self.assertEqual(tool["source"], "python")
+        self.assertEqual(tool["code"], "word_count('one two three')")
+        done = dict(events[-1][1])
+        self.assertEqual(done["source"], "python")
+        self.assertEqual(done["n_tokens"], 0)
+        self.assertEqual(done["stop_reason"], "tool")
+        self.assertIn("3 words", done["reply"])
+
+    def test_a_date_question_is_answered_without_the_model(self):
+        events = list(self.engine.stream_chat("What is the date today?", [], 0.0, 0.9))
+        done = dict(events[-1][1])
+        self.assertEqual(done["source"], "datetime")
+        self.assertEqual(done["n_tokens"], 0)
+        self.assertRegex(done["reply"],
+                         r"Today is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+                         r"\d{1,2} [A-Z][a-z]+ \d{4} \(UTC\)\.")
+        self.assertEqual(dict(events[0][1])["kind"], "datetime")
+
+    def test_no_rag_engine_ignores_an_indexed_document(self):
+        engine = make_engine(no_rag=True)
+        engine.docs = None
+        self.assertIsNone(engine.doc_info())
+
     def test_inputs_are_clamped(self):
         done = [d for k, d in self.engine.stream_chat("Hi", [], 99.0, -3.0) if k == "done"][0]
         self.assertEqual(done["temperature"], 1.5)
@@ -412,6 +565,67 @@ class HttpServerTests(unittest.TestCase):
             urllib.request.urlopen(req, timeout=10)
         self.assertEqual(ctx.exception.code, 404)
 
+    # ------------------------------------------------- documents over HTTP
+    def post_json(self, path, payload):
+        req = urllib.request.Request(self.url(path), method="POST",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return res.status, json.loads(res.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def get_json(self, path):
+        with urllib.request.urlopen(self.url(path), timeout=10) as res:
+            return json.loads(res.read())
+
+    def test_upload_indexes_a_document_and_the_chat_uses_it(self):
+        self.addCleanup(lambda: self.post_json("/api/docs/clear", {}))
+        body = ("The zorble lives in the warm shallows of the Cora River and eats "
+                "small silver fish. The marlow lives in the tall grass of the Plain "
+                "of Tesh and eats bright red berries.")
+        status, data = self.post_json("/api/upload", {"name": "notes.md", "text": body})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["name"], "notes.md")
+        self.assertGreaterEqual(data["chunks"], 1)
+        self.assertEqual(self.get_json("/api/docs")["doc"]["name"], "notes.md")
+        events = self.ndjson_chat({"message": "Where does the zorble live?",
+                                   "temperature": 0.0, "top_p": 0.9, "history": []})
+        types = [e["type"] for e in events]
+        self.assertIn("docs", types)
+        docs = events[types.index("docs")]
+        self.assertEqual(docs["doc"]["name"], "notes.md")
+        self.assertIn("Cora River", docs["hits"][0]["excerpt"])
+        done = events[-1]
+        self.assertEqual(done["type"], "done")
+        self.assertTrue(done["system"].startswith("Context from uploaded document:"))
+        self.assertIn("Cora River", done["system"])
+        self.assertLessEqual(done["prompt_tokens"], 256)
+        # ...and the document can be cleared again
+        status, cleared = self.post_json("/api/docs/clear", {})
+        self.assertTrue(cleared["cleared"])
+        self.assertIsNone(self.get_json("/api/docs")["doc"])
+
+    def test_upload_rejects_junk_instead_of_crashing(self):
+        status, data = self.post_json("/api/upload", {"name": "x.txt", "text": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("empty", data["error"])
+        status, data = self.post_json("/api/upload", {"name": "x.txt", "text": 42})
+        self.assertEqual(status, 400)
+        self.assertIn("string", data["error"])
+        status, data = self.post_json("/api/upload", {"name": "x.txt"})
+        self.assertEqual(status, 400)
+        req = urllib.request.Request(self.url("/api/upload"), method="POST",
+                                     data=b"not-json",
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 400)
+        # nothing was indexed by any of that
+        self.assertIsNone(self.get_json("/api/docs")["doc"])
+
     def test_stop_endpoint(self):
         req = urllib.request.Request(self.url("/api/stop"), method="POST", data=b"")
         with urllib.request.urlopen(req, timeout=10) as res:
@@ -448,6 +662,59 @@ class PageScriptTests(unittest.TestCase):
         # every placeholder was substituted before the script was emitted
         self.assertNotIn("__", self.script.replace("__proto__", ""))
 
+    def test_page_ships_the_reasoning_document_and_tool_ui(self):
+        html = self.html
+        for marker in ('id="uploadBtn"', 'id="fileInput"', 'id="docChip"', 'id="docClear"',
+                       'id="docCtl"', "📄 Upload Document (.txt / .md)",
+                       "Document (Local Q&amp;A)", "🐍 Python Tool Execution",
+                       "splitThink", "thinkingCard", "toolCard", "sourcesCard",
+                       "Copy answer", "🧠", "📄"):
+            self.assertIn(marker, html)
+        # the reasoning and source cards are styled, and the document rows exist
+        self.assertIn("nothing relevant in ", self.script)   # no-hit message
+        for rule in (".think", ".think-body", ".toolcard", ".sources", ".docrow"):
+            self.assertIn(rule, html)
+        # a system prompt or document text can never close the script tag it is in
+        self.assertNotIn("</script><", html)
+
+    def test_page_javascript_split_think_matches_the_server(self):
+        """The browser renders the card from `splitThink`; personas.split_think is
+        what the meta/JSON report believes. They must agree reply for reply."""
+        node = self.node()
+        fn = re.search(r"function splitThink\(text\) \{.*?\n\}", self.script, re.S)
+        helper = re.search(r"function stripThink\(text\) \{.*?\n\}", self.script, re.S)
+        self.assertIsNotNone(fn, "splitThink() is missing from the page")
+        self.assertIsNotNone(helper, "stripThink() is missing from the page")
+        cases = [
+            "plain answer",
+            "<think>1. a\n2. b</think>the answer",
+            "<think>unclosed reasoning",
+            "prefix <think>x</think> suffix",
+            "<think>a</think><think>b</think>keep",
+            "",
+            "<think></think>",
+        ]
+        harness = ("const DEFAULTS = { thinkOpen: " + json.dumps(personas.THINK_OPEN)
+                   + ", thinkClose: " + json.dumps(personas.THINK_CLOSE) + " };\n"
+                   + helper.group(0) + "\n" + fn.group(0)
+                   + "\nconst cases = " + json.dumps(cases) + ";\n"
+                   + "console.log(JSON.stringify(cases.map(splitThink)));\n")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(harness)
+        try:
+            result = subprocess.run([node, fh.name], capture_output=True, text=True)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        got = json.loads(result.stdout)
+        for case, browser in zip(cases, got):
+            with self.subTest(case=case):
+                thought = personas.split_think(case)
+                self.assertEqual(browser["reasoning"], thought.reasoning)
+                self.assertEqual(browser["answer"], thought.answer)
+                self.assertEqual(browser["closed"], thought.closed)
+                self.assertEqual(browser["hasReasoning"], thought.has_reasoning)
+
     def test_copy_code_extracts_fenced_blocks(self):
         node = self.node()
         fn = re.search(r"function extractCode\(text\) \{.*?\n\}", self.script, re.S)
@@ -470,6 +737,43 @@ class PageScriptTests(unittest.TestCase):
                          ["let x = 1;", "print(1)\n\nprint(2)", "", "let y = 2;"])
 
 
+class NoRagServerTests(unittest.TestCase):
+    """`--no-rag` must remove the feature, not just hide the button."""
+
+    @classmethod
+    def setUpClass(cls):
+        engine = make_engine(no_rag=True)
+        args = types.SimpleNamespace(temp=0.8, top_p=0.9, no_browser=True)
+        web_ui.Handler.engine = engine
+        web_ui.Handler.index_html = web_ui.render_index(args, engine).encode("utf-8")
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), web_ui.Handler)
+        cls.server.daemon_threads = True
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        # leave the shared Handler pointing at a rag-enabled engine
+        web_ui.Handler.engine = make_engine()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def test_upload_is_refused_and_the_page_hides_the_control(self):
+        req = urllib.request.Request(self.url("/api/upload"), method="POST",
+                                     data=json.dumps({"name": "a.txt", "text": "hello"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 403)
+        with urllib.request.urlopen(self.url("/api/docs"), timeout=10) as res:
+            self.assertEqual(json.loads(res.read()), {"doc": None, "rag": False})
+        html = web_ui.Handler.index_html.decode()
+        self.assertIn("rag: false", html)
+
+
 class GradioTests(unittest.TestCase):
     def test_history_conversion(self):
         msgs = [{"role": "user", "content": "hi"},
@@ -481,9 +785,8 @@ class GradioTests(unittest.TestCase):
         self.assertEqual(web_ui.gradio_history_to_pairs(None), [])
 
     def test_app_builds_when_gradio_installed(self):
-        try:
-            import gradio as gr                          # noqa: F401
-        except ImportError:
+        import importlib.util
+        if importlib.util.find_spec("gradio") is None:
             self.skipTest("gradio not installed (the web UI falls back to the stdlib UI)")
         engine = make_engine()
         args = types.SimpleNamespace(temp=0.8, top_p=0.9)
