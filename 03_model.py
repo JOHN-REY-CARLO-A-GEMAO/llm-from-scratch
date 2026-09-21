@@ -355,7 +355,18 @@ class Llama(nn.Module):
 
     def num_params(self, exclude_embeddings: bool = False) -> int:
         emb = self.wte.weight.numel()
-        tot = sum(p.numel() for p in self.parameters())
+        # In a regular fp32 model, every trainable tensor is a Parameter.
+        # lm_head shares its weight Parameter with wte (tied embeddings), so
+        # summing parameters() already counts it once. In a quantized model
+        # the weight matrices become int8 buffers (weight_q) but tied weights
+        # are replaced independently (QuantizedLinear copies buffers), so skip
+        # lm_head.weight_q to avoid double-counting the embedding.
+        tot = 0
+        for p in self.parameters():
+            tot += p.numel()
+        for name, buf in self.named_buffers():
+            if name.endswith(".weight_q") and not name.startswith("lm_head."):
+                tot += buf.numel()
         return tot - emb if exclude_embeddings else tot
 
     @torch.no_grad()

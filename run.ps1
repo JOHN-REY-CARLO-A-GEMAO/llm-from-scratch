@@ -4,11 +4,11 @@
   No training, no GPU, no dataset - just the checkpoint committed to this repo.
 
 .DESCRIPTION
-  `out/model_best.pt` (1.9 M params, ~8 MB, Llama-3 style) ships with the repository, so this
-  script never trains anything: it checks your Python + PyTorch, then samples
-  from the checkpoint. That is the whole workflow - training happened once, on
-  another machine, and its result is committed here (README section "Generate
-  text (CPU, no training)").
+  `out/model_15m_chat.pt` (~15 M params, ~60 MB fp32 / ~15 MB INT8, Llama-3 style)
+  ships with the repository, so this script never trains anything: it checks your
+  Python + PyTorch, auto-picks the INT8-quantized checkpoint when available, then
+  samples. That is the whole workflow - training happened once, on another machine,
+  and its result is committed here (README section "Generate text (CPU, no training)").
 
   First-time setup, once per machine:
       python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -20,6 +20,7 @@
   .\run.ps1 -Chat                                  # instruction-tuned multi-turn chatbot
   .\run.ps1 -Seed 4294967295                       # reproducible output
   .\run.ps1 -Python "C:\Python312\python.exe"      # pick a specific interpreter
+  .\run.ps1 -Int8                                  # force INT8 quantized checkpoint
 
 .NOTES
   If script execution is blocked by policy, use run.bat (forwards every
@@ -33,11 +34,12 @@ param(
     [int]   $TopK   = 40,
     [double]$TopP   = 0.9,
     [long]  $Seed   = -1,         # -1 = random (the seed used is printed)
-    [string]$Ckpt   = "out/model_best.pt",
+    [string]$Ckpt   = "",          # empty = auto-select (15m -> 1.9m, int8 preferred)
     [string]$Python = "python",
     [double]$RepeatPenalty = 1.15,
     [switch]$Interactive,
-    [switch]$Chat
+    [switch]$Chat,
+    [switch]$Int8
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,20 +71,38 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- 3. is the checkpoint there? -------------------------------------------
-# -Chat selects the SFT checkpoint unless the caller explicitly chose -Ckpt.
-if ($Chat -and -not $PSBoundParameters.ContainsKey("Ckpt")) { $Ckpt = "out/model_chat.pt" }
+# --- 3. pick a checkpoint: 15M preferred, INT8 preferred -------------------
+if ($Ckpt -eq "") {
+    $suffix = $(if ($Int8) { "_int8.pt" } else { ".pt" })
+    $base = $(if ($Chat) { "out/model_15m_chat" } else { "out/model_15m_best" })
+    $fallback = $(if ($Chat) { "out/model_chat" } else { "out/model_best" })
+    # Auto-prefer INT8 if it exists and -Int8 wasn't forced off
+    if (-not $Int8) {
+        foreach ($c in @("out/model_15m_chat_int8.pt", "out/model_chat_int8.pt",
+                        "out/model_15m_best_int8.pt", "out/model_best_int8.pt")) {
+            if ((-not $Chat -and ($c -like "*best*")) -or ($Chat -and ($c -like "*chat*"))) {
+                if (Test-Path -LiteralPath $c) { $Ckpt = $c; break }
+            }
+        }
+    }
+    if ($Ckpt -eq "") {
+        foreach ($c in @($base + $suffix, $fallback + $suffix,
+                         $base + ".pt", $fallback + ".pt")) {
+            if (Test-Path -LiteralPath $c) { $Ckpt = $c; break }
+        }
+    }
+}
 if (-not (Test-Path -LiteralPath $Ckpt)) {
     Write-Host "[run] Checkpoint '$Ckpt' not found." -ForegroundColor Yellow
-    Write-Host "      It is committed to this repository (~8 MB) - fetch it with:  git pull"
-    Write-Host "      (git pull must have completed; the file lives at out/model_best.pt)"
+    Write-Host "      Run git pull to fetch the committed checkpoint (~15 MB for the 15M model)."
     exit 1
 }
 
 # --- 4. generate ------------------------------------------------------------
-Write-Host "[run] generating with $exe  (Ctrl+C stops it)" -ForegroundColor Cyan
+Write-Host "[run] generating with $exe from $Ckpt (Ctrl+C stops it)" -ForegroundColor Cyan
 $genArgs = @("generate.py", "--ckpt", $Ckpt, "--prompt", $Prompt, "--n", $N,
              "--temp", $Temp, "--top-k", $TopK, "--top-p", $TopP, "--repeat-penalty", $RepeatPenalty)
+if ($Int8) { $genArgs += "--quantized" }
 if ($Interactive) { $genArgs += "--interactive" }
 if ($Chat) { $genArgs += "--chat" }
 if ($Seed -ge 0) { $genArgs += @("--seed", $Seed) }
