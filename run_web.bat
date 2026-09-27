@@ -2,6 +2,7 @@
 rem One-click Windows launcher: chat with the fine-tuned model in your browser.
 rem Double-click this file, or forward any argument:
 rem     run_web.bat -Port 8080
+rem     run_web.bat -Gguf   (after python download_model.py and installing llama-cpp-python)
 rem It simply calls run_web.ps1 with the execution policy bypassed, so no admin
 rem rights and no PowerShell configuration are needed. The page opens at
 rem http://127.0.0.1:7860 (also reachable on your LAN via 0.0.0.0:7860).

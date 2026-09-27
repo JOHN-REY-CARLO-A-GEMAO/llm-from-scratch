@@ -1,3 +1,102 @@
+# LLM from scratch — Dual-engine local LLM platform
+
+A practical local language-model stack: custom PyTorch training and inference,
+INT8 quantization, plus an optional GGUF engine powered by `llama-cpp-python`.
+The custom architecture uses RMSNorm, RoPE, SwiGLU, and scaled dot-product
+attention. GGUF is an optional inference backend; it does not alter the custom
+training pipeline.
+
+## v1.0 platform overview
+
+```text
+                         ┌── Custom PyTorch model (.pt / INT8)
+Browser ── NDJSON UI ────┤       └── custom tokenizer + streaming generation
+                         └── GGUF model (.gguf)
+                                 └── llama-cpp-python streaming chat
+Both engines ── System personas · local tool hooks · conversation history
+```
+
+| Configuration | Engine | Parameters | Approx. weight storage | Status |
+|---|---|---:|---:|---|
+| Compact custom INT8 | PyTorch + per-channel INT8 | 7.16M (as packaged) | about 12 MB | Default, CPU friendly |
+| 7B scaling preset | PyTorch, 4096/32/32/11008, tied 4096-token vocab | 6,493,048,832 (6.49B) | about 26.0 GB FP32 weights alone | Architecture preset; not trained in this environment |
+| Downloaded instruct model | llama.cpp GGUF (Q4 variants) | Depends on selected model | model-dependent | Optional external model |
+
+**Parameter-count note:** the 6.49B preset uses the repository's 4096-token BPE
+and tied embeddings. It is not a 6.7B checkpoint and the parameter total is not
+a claim that this model has been trained. For an actual GGUF chat model, see the
+download and launch commands below.
+
+### Feature overview
+
+- **Streaming:** browser replies use newline-delimited JSON (NDJSON) and render
+  incrementally; `generate.py` also has a streaming GGUF helper.
+- **System prompts:** persona picker and editable custom system text are sent to
+  either engine.
+- **Tool calling:** deterministic local calculator/Python-AST hooks remain
+  available; safe inline tool markers are filtered during output.
+- **INT8 quantization:** custom PyTorch weights support per-channel INT8 through
+  `quantize.py`.
+- **Web UI:** conversation history, sampling controls, performance counters,
+  document retrieval and chat personas, with a header engine selector.
+- **GGUF:** optional Hugging Face downloader and `llama-cpp-python` backend.
+
+Screenshots are not included in this source checkout; run the local web UI to
+see the live interface.
+
+## Windows quickstart
+
+Use Python 3.10+ and PowerShell. From the repository directory:
+
+```powershell
+# Install the CPU-only custom engine dependency
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Start the custom model web UI (default engine)
+.\run_web.ps1
+# or double-click run_web.bat
+```
+
+To use a GGUF model, download one and install the optional runtime:
+
+```powershell
+python download_model.py
+python -m pip install llama-cpp-python
+.\run_web.ps1 -Gguf
+```
+
+The batch launcher forwards switches to PowerShell, so `run_web.bat -Gguf` works
+as well. The launcher discovers the downloaded `.gguf` in `models/`; the Model
+Selector is enabled only when the runtime and a model load successfully. For
+direct text generation, substitute the downloaded filename:
+
+```powershell
+python generate.py --gguf models\<downloaded-model>.gguf --prompt "Explain RoPE briefly" -n 100
+```
+
+For local tests:
+
+```powershell
+bash tests/run_all.sh
+```
+
+On Windows without Bash, run `python -m unittest discover -s tests -p "test_*.py"`.
+Tests require the dependencies described in each test and may load committed
+checkpoints.
+
+## Custom model and training
+
+The custom PyTorch path, tokenizer, preprocessing, training, evaluation, and
+quantization workflows are documented in **`GUIDE.md`**. A 7B architecture
+configuration is available using `python 04_train.py --arch 7b`; use an
+appropriate high-memory machine and packed dataset. Activation checkpointing is
+enabled for that preset, with microbatch 1 and gradient accumulation 16 by
+default. A 7B FP32 optimizer run needs far more memory than a typical desktop; it
+is not a promise that the model can train on CPU-only hardware.
+
+
+---
+
 # LLM from scratch — data → tokenizer → transformer → training → eval → generation
 
 A complete, working, small-scale language model built without `transformers`,

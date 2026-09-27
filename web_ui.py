@@ -164,6 +164,7 @@ class ChatEngine:
         self.args = args
         self.torch = torch
         self.model = model
+        self.gguf = None
         self.cfg = cfg
         self.tok = tok
         self.tok_mod = tok_mod
@@ -195,6 +196,7 @@ class ChatEngine:
         label, text = personas.resolve(self.default_persona_value, tool_hint=self.tools_on)
         return {
             "app": APP_NAME,
+            "engines": {"custom": True, "gguf": self.gguf is not None},
             "persona": label,
             "personas": personas.choices(),
             "system": text,
@@ -357,9 +359,63 @@ class ChatEngine:
         return user, turns, ids, dropped, system
 
     # ------------------------------------------------------------ generation
+    def stream_gguf(self, message, history, temperature, top_p, max_new, system_text, system_label):
+        """OpenAI-compatible llama-cpp stream, adapted to the existing NDJSON events."""
+        if self.gguf is None:
+            yield ("error", "GGUF engine unavailable. Install llama-cpp-python and launch with --gguf models/model.gguf.")
+            return
+        query = tools.find_tool_question(str(message)) if self.tools_on else None
+        if query is not None and query.bare:
+            yield ("tool", query.to_event())
+            yield ("token", query.answer)
+            yield ("done", {"reply": query.answer, "n_tokens": 0, "tok_per_s": None,
+                            "elapsed_s": 0.0, "first_token_s": 0.0, "stop_reason": "tool",
+                            "persona": system_label, "system": system_text, "tool_calls": []})
+            return
+        messages = []
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        for turn in history or []:
+            if isinstance(turn, (list, tuple)) and len(turn) >= 2:
+                messages.extend(({"role": "user", "content": str(turn[0])},
+                                 {"role": "assistant", "content": str(turn[1])}))
+            elif isinstance(turn, dict) and turn.get("role") in ("user", "assistant"):
+                messages.append({"role": turn["role"], "content": str(turn.get("content", ""))})
+        messages.append({"role": "user", "content": str(message)})
+        started = time.perf_counter()
+        filter_text = tools.ToolTextFilter() if self.tools_on else None
+        pieces = []
+        try:
+            with self.model_lock:
+                response = self.gguf.create_chat_completion(
+                    messages=messages, max_tokens=max_new, temperature=temperature,
+                    top_p=top_p, stream=True)
+                for chunk in response:
+                    choice = (chunk.get("choices") or [{}])[0]
+                    text = (choice.get("delta") or {}).get("content") or ""
+                    if filter_text:
+                        text = filter_text.feed(text)
+                    if text:
+                        pieces.append(text); yield ("token", text)
+                if filter_text:
+                    tail = filter_text.finish()
+                    if tail:
+                        pieces.append(tail); yield ("token", tail)
+            reply = "".join(pieces).strip()
+            elapsed = max(time.perf_counter() - started, 1e-9)
+            n_tokens = len(reply.split())
+            yield ("done", {"reply": reply, "n_tokens": n_tokens,
+                            "tok_per_s": round(n_tokens / elapsed, 2),
+                            "elapsed_s": round(elapsed, 4), "first_token_s": round(elapsed, 4),
+                            "stop_reason": "eos", "persona": system_label,
+                            "system": system_text, "tool_calls": []})
+        except Exception as exc:
+            yield ("error", f"GGUF generation failed: {exc}")
+
     def stream_chat(self, message: str, history, temperature: float, top_p: float,
+
                     max_tokens: int | None = None, system: str | None = None,
-                    persona: str | None = None):
+                    persona: str | None = None, engine: str = "custom"):
         """Yield ("token", text) / ("tool", info) / ("docs", info) / ("done", meta) / ("error", msg).
 
         Generation runs on a worker thread (the caller's thread is busy
@@ -393,6 +449,10 @@ class ChatEngine:
         max_new = min(max(max_new, 1), self.cfg.block_size - 1)
 
         system_label, system_text = self.resolve_system(system, persona)
+        if engine == "gguf":
+            yield from self.stream_gguf(message, history, temperature, top_p, max_new,
+                                        system_text, system_label)
+            return
         try:
             user, turns, prompt_ids, dropped, system_text = self.build_prompt(
                 message, history, max_new, system_text)
@@ -784,6 +844,10 @@ footer {
     <div class="subtitle" id="subtitle">local LLM · built from scratch</div>
   </div>
   <div class="spacer"></div>
+  <select id="modelSelector" aria-label="Model Selector" title="Select inference engine">
+    <option value="custom" __CUSTOM_SELECTED__>🤖 Custom 7M Model (INT8 - 12MB)</option>
+    <option value="gguf" __GGUF_SELECTED__>🧠 Llama-3 / Qwen 7B (GGUF)</option>
+  </select>
   <span class="chip" title="Token counter + latency monitor: live tokens, tokens/second and elapsed time for the current reply">
     ⚡ <span id="perf">idle</span></span>
   <span class="chip hide-sm" title="Session totals since this page was loaded: generated tokens and replies">
@@ -864,6 +928,7 @@ const tempEl = document.getElementById('temp'), tempVal = document.getElementByI
 const toppEl = document.getElementById('topp'), toppVal = document.getElementById('toppVal');
 const personaEl = document.getElementById('persona');
 const promptEl = document.getElementById('systemPrompt');
+const modelSelector = document.getElementById('modelSelector');
 const sysNote = document.getElementById('sysNote');
 const perfEl = document.getElementById('perf');
 const totalsEl = document.getElementById('totals');
@@ -1177,6 +1242,7 @@ async function send(text) {
         history: history,
         persona: personaEl.value,
         system: selectedSystem(),
+        engine: modelSelector.value,
       }),
       signal: controller.signal,
     });
@@ -1415,6 +1481,9 @@ updateTotals();
   try {
     const res = await fetch('/api/info');
     const info = await res.json();
+    const ggufOption = modelSelector.querySelector('option[value="gguf"]');
+    ggufOption.disabled = !(info.engines && info.engines.gguf);
+    if (ggufOption.disabled && modelSelector.value === 'gguf') modelSelector.value = 'custom';
     document.getElementById('statusDot').className = 'dot ok';
     document.getElementById('statusText').textContent = 'model ready';
     document.getElementById('subtitle').textContent =
@@ -1543,7 +1612,8 @@ class Handler(BaseHTTPRequestHandler):
             payload.get("message", ""), payload.get("history"),
             payload.get("temperature", 0.8), payload.get("top_p", 0.9),
             payload.get("max_tokens"),
-            system=payload.get("system"), persona=payload.get("persona"))
+            system=payload.get("system"), persona=payload.get("persona"),
+                    engine=payload.get("engine", getattr(self.engine.args, "default_engine", "custom")))
         try:
             for kind, data in gen:
                 if isinstance(data, dict):       # done / tool payloads pass through
@@ -1621,6 +1691,8 @@ def render_index(args, engine: ChatEngine | None = None) -> str:
     personas_json = json.dumps(personas.choices(), ensure_ascii=False).replace("<", "\\u003c")
     return (INDEX_HTML
             .replace("__APP_NAME__", APP_NAME)
+            .replace("__CUSTOM_SELECTED__", "selected" if getattr(args, "default_engine", "custom") != "gguf" else "")
+            .replace("__GGUF_SELECTED__", "selected" if getattr(args, "default_engine", "custom") == "gguf" else "")
             .replace("__TEMP__", f"{args.temp:g}")
             .replace("__TOPP__", f"{args.top_p:g}")
             .replace("__PERSONAS_JSON__", personas_json)
@@ -1781,6 +1853,9 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--ckpt", default=None,
                     help="chat checkpoint (.pt); auto-selects model_15m_chat(_int8).pt when present")
+    ap.add_argument("--gguf", default=None, help="optional GGUF model path; enables the GGUF engine")
+    ap.add_argument("--engine", choices=("custom", "gguf"), default="custom",
+                    help="initial engine selection (requires --gguf for gguf)")
     ap.add_argument("--config", default=None,
                     help="default: <ckpt>_config.json (i.e. out/model_15m_chat_config.json), then config.json/txt")
     ap.add_argument("--tokenizer", default="tokenizer/chat", help="chat tokenizer directory")
@@ -1900,6 +1975,21 @@ def main() -> None:
                 f"(the base tokenizer has no chat markers).")
 
     engine = ChatEngine(args, torch, model, cfg, tok, tok_mod, gen_mod, ckpt, cfg_path, tok_dir)
+    args.default_engine = args.engine
+    if args.gguf:
+        gguf_path = resolve(Path(args.gguf))
+        if not gguf_path.is_file():
+            die(f"GGUF model not found: {gguf_path}. Download one with download_model.py.")
+        try:
+            engine.gguf = cli.load_gguf_model(gguf_path, n_ctx=2048, n_threads=args.threads,
+                                              verbose=False)
+            print(f"[web] GGUF engine loaded: {gguf_path}")
+        except RuntimeError as exc:
+            print(f"[web] GGUF engine unavailable: {exc}; using the PyTorch engine.", flush=True)
+            args.default_engine = "custom"
+    elif args.engine == "gguf":
+        print("[web] --engine gguf requested without --gguf; using custom engine.")
+        args.default_engine = "custom"
     engine.device = torch.device("cpu")             # CPU-only, like generate.py, on purpose
     qtag = "  INT8 quantized" if quantize.is_quantized(model) else ""
     print(f"[web] torch {torch.__version__}  device cpu  threads {args.threads}")

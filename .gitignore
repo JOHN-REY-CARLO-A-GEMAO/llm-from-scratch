@@ -37,6 +37,9 @@ eval.json
 # (see README "Reproduce from scratch"); the corpus itself IS committed.
 data/packed/
 
+# Downloaded external model weights (can be several GB; never commit these)
+models/*.gguf
+
 # logs
 *.log
 

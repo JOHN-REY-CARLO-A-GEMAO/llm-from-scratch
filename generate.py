@@ -231,6 +231,25 @@ def run_prompt(prompt, args, model, cfg, tok, tok_mod, gen_mod, device) -> None:
         print(f"[gen] seed {seed}  (re-run with --seed {seed} to reproduce this text)")
 
 
+def load_gguf_model(path: str | Path, **kwargs):
+    """Load a GGUF via optional llama-cpp-python, with an actionable fallback error."""
+    try:
+        from llama_cpp import Llama
+    except ImportError as exc:
+        raise RuntimeError("GGUF support needs llama-cpp-python; install with: "
+                           "python -m pip install llama-cpp-python") from exc
+    return Llama(model_path=str(path), **kwargs)
+
+
+def stream_gguf(model, prompt: str, max_tokens: int = 128, **sampling):
+    """Yield streamed text chunks from a GGUF model (standalone inference helper)."""
+    for item in model.create_completion(prompt=prompt, max_tokens=max_tokens,
+                                        stream=True, **sampling):
+        text = (item.get("choices") or [{}])[0].get("text", "")
+        if text:
+            yield text
+
+
 def serialize_chat(system: str, turns, user: str) -> str:
     """The exact SFT template, plus an optional leading system turn.
 
@@ -507,6 +526,8 @@ def main() -> None:
         prog="generate.py",
         description="Generate text from a trained checkpoint on the CPU.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument("--gguf", default=None, metavar="FILE",
+                    help="generate directly from a GGUF model using optional llama-cpp-python")
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint (.pt); defaults to model_15m_chat.pt / model_15m_chat_int8.pt in --chat, "
                          "else model_best.pt")
@@ -546,6 +567,21 @@ def main() -> None:
                     help="disable the calculator: arithmetic questions go to the model "
                          "and <<calc: …>> markers are shown as written")
     args = ap.parse_args()
+    if args.gguf:
+        gguf_path = resolve(Path(args.gguf))
+        if not gguf_path.is_file():
+            die(f"GGUF model {gguf_path} not found. Download with python download_model.py")
+        try:
+            model = load_gguf_model(gguf_path, n_ctx=2048,
+                                    n_threads=args.threads or (os.cpu_count() or 1), verbose=False)
+            for text in stream_gguf(model, args.prompt, max_tokens=args.n,
+                                    temperature=args.temp, top_p=args.top_p,
+                                    repeat_penalty=args.repeat_penalty):
+                sys.stdout.write(text); sys.stdout.flush()
+            print()
+            return
+        except RuntimeError as exc:
+            die(str(exc))
     if args.chat:
         args.interactive = True
     # Default checkpoint selection: prefer the 15M chat checkpoint if present,

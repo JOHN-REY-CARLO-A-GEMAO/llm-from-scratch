@@ -53,7 +53,8 @@ param(
     [switch]$NoTools,             # disable the calculator/python hook
     [string]$Doc     = "",       # preload a .txt/.md document for local Q&A
     [switch]$NoRag,               # disable document upload + retrieval
-    [switch]$Int8
+    [switch]$Int8,
+    [switch]$Gguf
 )
 
 $ErrorActionPreference = "Stop"
@@ -111,6 +112,14 @@ if (-not (Test-Path -LiteralPath $configPath)) { $configPath = "out/config.json"
 # --- 4. serve ---------------------------------------------------------------
 $webArgs = @("web_ui.py", "--host", $BindHost, "--port", $Port, "--ckpt", $Ckpt)
 if ($Int8) { $webArgs += "--quantized" }
+if ($Gguf) {
+    $ggufFile = Get-ChildItem -Path "models" -Filter "*.gguf" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $ggufFile) {
+        Write-Host "[web] No GGUF file found in models/. Run: python download_model.py" -ForegroundColor Yellow
+        exit 1
+    }
+    $webArgs += @("--gguf", $ggufFile.FullName, "--engine", "gguf")
+}
 if ($NoBrowser) { $webArgs += "--no-browser" }
 if ($Persona) { $webArgs += @("--persona", $Persona) }
 if ($SystemPrompt) { $webArgs += @("--system", $SystemPrompt) }
