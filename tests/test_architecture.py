@@ -43,6 +43,19 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mm.GPTConfig.load(p)
 
+    def test_7b_preset_dimensions_and_parameter_formula(self):
+        cfg = mm.GPTConfig.preset("7B")
+        self.assertEqual((cfg.d_model, cfg.n_layer, cfg.n_head, cfg.mlp_hidden),
+                         (4096, 32, 32, 11008))
+        self.assertEqual(cfg.head_dim, 128)
+        self.assertTrue(cfg.gradient_checkpointing)
+        # Tied token/output embeddings, four attention matrices, three SwiGLU
+        # matrices, two norm gains per block, and one final norm gain.
+        expected = (cfg.vocab_size * cfg.d_model + cfg.n_layer * (
+            4 * cfg.d_model**2 + 3 * cfg.d_model * cfg.mlp_hidden + 2 * cfg.d_model
+        ) + cfg.d_model)
+        self.assertEqual(expected, 6_493_048_832)
+
     def test_swiglu_width_rule(self):
         # 8/3 * d_model, rounded up to a multiple of 64 (Llama's rule)
         cfg = tiny_cfg(d_model=160)

@@ -103,6 +103,10 @@ def write_cfg(out: Path, cfg) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--arch", choices=["custom", "7b", "7B"], default="custom",
+                    help="architecture preset; 7b uses 4096/32/32/11008 and checkpointing")
+    ap.add_argument("--gradient-checkpointing", action="store_true",
+                    help="recompute transformer blocks during backward to reduce activation RAM")
     ap.add_argument("--data-dir", default="data/packed")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--block-size", type=int, default=256)
@@ -163,9 +167,20 @@ def main() -> None:
     meta = json.loads((Path(args.data_dir) / "dataset_info.json").read_text())
     vocab = meta["vocab"]
 
-    cfg = GPTConfig(vocab_size=vocab, block_size=args.block_size, n_layer=args.n_layer,
-                    n_head=args.n_head, d_model=args.d_model, dropout=args.dropout,
-                    rope_base=args.rope_base)
+    if args.arch.lower() == "7b":
+        # Keep microbatch and sequence length conservative; users can still
+        # explicitly choose a shorter block, but not exceed the 128-token preset.
+        args.block_size = min(args.block_size, 128)
+        cfg = GPTConfig.preset("7b", vocab_size=vocab, block_size=args.block_size,
+                              dropout=args.dropout, rope_base=args.rope_base,
+                              gradient_checkpointing=True)
+        args.batch_size = min(args.batch_size, 1)
+        args.grad_accum = max(args.grad_accum, 16)
+    else:
+        cfg = GPTConfig(vocab_size=vocab, block_size=args.block_size, n_layer=args.n_layer,
+                        n_head=args.n_head, d_model=args.d_model, dropout=args.dropout,
+                        rope_base=args.rope_base,
+                        gradient_checkpointing=args.gradient_checkpointing)
     model = GPT(cfg).to(dev)
     if args.compile:
         model = torch.compile(model)
@@ -223,13 +238,26 @@ def main() -> None:
 
         # gradient accumulation: larger effective batch at the cost of memory only
         opt.zero_grad(set_to_none=True)
-        for _ in range(args.grad_accum):
-            x, y = get_batch(train, args.batch_size, dev, gen)
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16,
-                                enabled=amp and dev.type == "cpu"):
-                _, loss = model(x, y)
-            (loss / args.grad_accum).backward()
-            running += loss.item()
+        try:
+            for _ in range(args.grad_accum):
+                x, y = get_batch(train, args.batch_size, dev, gen)
+                with torch.autocast(device_type="cpu", dtype=torch.bfloat16,
+                                    enabled=amp and dev.type == "cpu"):
+                    _, loss = model(x, y)
+                (loss / args.grad_accum).backward()
+                running += loss.item()
+        except (MemoryError, RuntimeError) as exc:
+            is_oom = isinstance(exc, MemoryError) or "out of memory" in str(exc).lower()
+            if not is_oom:
+                raise
+            import resource
+            peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # Linux reports KiB; macOS reports bytes.
+            peak_gb = peak_rss / (1024**2) if os.name == "posix" and peak_rss > 10**8 else peak_rss / 1e9
+            print(f"[oom] iter={it} device={dev} process_peak_rss_gb={peak_gb:.3f}; "
+                  f"error={type(exc).__name__}: {exc}", flush=True)
+            opt.zero_grad(set_to_none=True)
+            return
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

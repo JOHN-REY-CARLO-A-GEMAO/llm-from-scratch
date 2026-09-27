@@ -81,9 +81,27 @@ class GPTConfig:
     n_layer: int = 4
     n_head: int = 5
     d_model: int = 160
+    d_ff: int | None = None          # optional explicit SwiGLU width (e.g. Llama 7B: 11008)
     dropout: float = 0.0           # 0.0 for large corpora; >0 only if overfitting
     rope_base: float = 10_000.0    # raise (1e5..5e5) to extend context beyond training
     rms_norm_eps: float = 1e-5     # Llama-3 value; the norm is computed in fp32
+    gradient_checkpointing: bool = False  # training-only activation rematerialization
+
+    @classmethod
+    def preset(cls, name: str, **overrides) -> "GPTConfig":
+        """Named model sizes; 7b follows the requested Llama-7B dimensions.
+
+        The repository's BPE vocabulary is 4096 and embeddings are tied, so the
+        resulting parameter count is smaller than untied 32k-vocabulary Llama 7B.
+        """
+        key = str(name).lower()
+        presets = {
+            "7b": dict(d_model=4096, n_layer=32, n_head=32, d_ff=11008, vocab_size=4096,
+                       block_size=128, gradient_checkpointing=True),
+        }
+        if key not in presets:
+            raise ValueError(f"unknown architecture preset {name!r}; available: {', '.join(presets)}")
+        return cls(**(presets[key] | overrides))
 
     @property
     def head_dim(self) -> int:
@@ -94,7 +112,7 @@ class GPTConfig:
     def mlp_hidden(self) -> int:
         """SwiGLU width: 8/3 * d_model (FLOPs-matched to a 4x GELU MLP), padded
         up to a multiple of 64 like Llama so the matrix is kernel-friendly."""
-        return 64 * ((int(8 * self.d_model / 3) + 63) // 64)
+        return self.d_ff if self.d_ff is not None else 64 * ((int(8 * self.d_model / 3) + 63) // 64)
 
     def save(self, path: str | Path) -> None:
         """Plain JSON, one canonical format. A checkpoint whose config cannot be
@@ -311,7 +329,12 @@ class Llama(nn.Module):
                                     x.device, torch.float32)
         cos, sin = cos[past:past + T][None, None], sin[past:past + T][None, None]
         for i, block in enumerate(self.blocks):
-            x = block(x, cos, sin, None if kv_cache is None else kv_cache[i])
+            if (self.training and self.cfg.gradient_checkpointing and
+                    kv_cache is None and torch.is_grad_enabled()):
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(block, x, cos, sin, use_reentrant=False)
+            else:
+                x = block(x, cos, sin, None if kv_cache is None else kv_cache[i])
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
