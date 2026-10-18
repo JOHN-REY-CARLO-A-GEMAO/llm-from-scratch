@@ -148,7 +148,7 @@ class TokenStream:
     def __init__(self, tok, unicode_to_bytes, tool_filter=None, display=None):
         self.tok = tok
         self.to_bytes = unicode_to_bytes
-        self.special = {tok.token_to_id[s] for s in tok.special_tokens}
+        self.special = {tok.token_to_id[s] for s in tok.special_tokens + getattr(tok, "added_tokens", [])}
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.n_special = 0
         self.tool_filter = tool_filter
