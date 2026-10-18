@@ -1,0 +1,11 @@
+{
+  "vocab_size": 8194,
+  "n_merges": 7935,
+  "special_tokens": [
+    "<|doc_end|>"
+  ],
+  "added_tokens": [
+    "<|im_start|>",
+    "<|im_end|>"
+  ]
+}

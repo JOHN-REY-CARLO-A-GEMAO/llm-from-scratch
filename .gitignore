@@ -44,3 +44,7 @@ data/packed/
 __pycache__/
 *.pyc
 .venv/
+chatgpt_45m_model.zip
+data/general/
+data/packed_512/
+export_45m/
